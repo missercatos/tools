@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+# encdec -- 编码解码全家桶（零依赖：python3 stdlib）
+# 用法: encdec -d|-e <模式> <字符串>
+# 模式: b64 hex url urlall rot13 rot:N ascii binary oct html unicode gzip zlib md5 sha1 sha256
+
+import argparse
+import base64
+import binascii
+import gzip
+import hashlib
+import html
+import json
+import sys
+import urllib.parse
+import zlib
+
+
+def b64(s, decode):
+    return base64.b64decode(s).decode("utf-8", "replace") if decode else base64.b64encode(s.encode()).decode()
+
+
+def b64u(s, decode):
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad).decode("utf-8", "replace") if decode else base64.urlsafe_b64encode(s.encode()).rstrip(b"=").decode()
+
+
+def hex_(s, decode):
+    return bytes.fromhex(s).decode("utf-8", "replace") if decode else s.encode().hex()
+
+
+def url(s, decode):
+    return urllib.parse.unquote(s) if decode else urllib.parse.quote(s)
+
+
+def urlall(s, decode):
+    return urllib.parse.unquote(s) if decode else urllib.parse.quote(s, safe="")
+
+
+def rot(s, n):
+    n = n % 26
+    out = []
+    for ch in s:
+        if "a" <= ch <= "z":
+            out.append(chr((ord(ch) - 97 + n) % 26 + 97))
+        elif "A" <= ch <= "Z":
+            out.append(chr((ord(ch) - 65 + n) % 26 + 65))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def ascii_(s, decode):
+    return "".join(chr(int(c)) for c in s.split()) if decode else " ".join(str(ord(c)) for c in s)
+
+
+def binary(s, decode):
+    if decode:
+        return "".join(chr(int(s[i:i + 8], 2)) for i in range(0, len(s), 8))
+    return " ".join(f"{ord(c):08b}" for c in s)
+
+
+def oct_(s, decode):
+    return "".join(chr(int(c, 8)) for c in s.split()) if decode else " ".join(f"{ord(c):o}" for c in s)
+
+
+def html_(s, decode):
+    return html.unescape(s) if decode else html.escape(s)
+
+
+def unicode_(s, decode):
+    if decode:
+        return s.encode().decode("unicode_escape")
+    return s.encode("unicode_escape").decode()
+
+
+def gz(s, decode):
+    if decode:
+        return gzip.decompress(b64(s, True).encode("latin-1")).decode("utf-8", "replace")
+    return base64.b64encode(gzip.compress(s.encode())).decode()
+
+
+def zl(s, decode):
+    if decode:
+        return zlib.decompress(b64(s, True).encode("latin-1")).decode("utf-8", "replace")
+    return base64.b64encode(zlib.compress(s.encode())).decode()
+
+
+def digest(s, algo):
+    h = hashlib.new(algo)
+    h.update(s.encode())
+    return h.hexdigest()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="encdec", description="编码解码全家桶(零依赖)")
+    ap.add_argument("mode", help="b64|b64url|hex|url|urlall|rot:N|ascii|binary|oct|html|unicode|gzip|zlib|md5|sha1|sha256")
+    ap.add_argument("string", help="要处理的字符串(可用 @文件 或 - 从 stdin)")
+    ap.add_argument("-d", "--decode", action="store_true", help="解码(默认编码); hash/rot 不受影响")
+    ap.add_argument("-e", "--encode", action="store_true", help="编码")
+    args = ap.parse_args()
+
+    s = args.string
+    if s == "-":
+        s = sys.stdin.read().rstrip("\n")
+    elif s.startswith("@"):
+        s = open(s[1:]).read().rstrip("\n")
+    if args.decode:
+        s = s.strip()
+
+    mode = args.mode.lower()
+    try:
+        if mode == "b64":
+            print(b64(s, args.decode))
+        elif mode == "b64url":
+            print(b64u(s, args.decode))
+        elif mode == "hex":
+            print(hex_(s, args.decode))
+        elif mode == "url":
+            print(url(s, args.decode))
+        elif mode == "urlall":
+            print(urlall(s, args.decode))
+        elif mode == "rot" or (mode.startswith("rot") and mode[3:].lstrip(":").isdigit()):
+            n = mode[3:].lstrip(":")
+            print(rot(s, int(n) if n else 13))
+        elif mode == "ascii":
+            print(ascii_(s, args.decode))
+        elif mode == "binary":
+            print(binary(s, args.decode))
+        elif mode == "oct":
+            print(oct_(s, args.decode))
+        elif mode == "html":
+            print(html_(s, args.decode))
+        elif mode == "unicode":
+            print(unicode_(s, args.decode))
+        elif mode in ("gzip", "gz"):
+            print(gz(s, args.decode))
+        elif mode == "zlib":
+            print(zl(s, args.decode))
+        elif mode in hashlib.algorithms_available:
+            print(digest(s, mode))
+        else:
+            sys.exit(f"[-] 未知模式: {mode}")
+    except Exception as e:
+        sys.exit(f"[-] 处理失败: {e}")
+
+
+if __name__ == "__main__":
+    main()

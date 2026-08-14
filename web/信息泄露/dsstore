@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# dsstore -- 解析 macOS .DS_Store 隐藏文件，列出目录文件清单
+# .DS_Store 是 Finder 在每个访问过的文件夹自动生成的隐藏文件，
+# 记录该目录的视图设置与自定义属性(noteustr 备注等)，
+# 实战价值: 泄露目录下所有文件名(UTF-16BE 编码，strings 解不出来)
+
+set -u
+INPUT="" NOTES=0 RECURSE=0
+
+usage() {
+    cat <<'EOF'
+dsstore -- 解析 .DS_Store，列出目录里的文件名清单
+
+用法: dsstore [--notes] [--recurse] <本地文件|URL>
+
+参数:
+  --notes        同时显示每条记录的自定义属性备注(如 "flag here!")
+  --recurse      仅 URL 模式: 发现子目录后递归抓取下一层 .DS_Store
+  -h, --help     显示本帮助
+
+输入:
+  /path/.DS_Store   本地文件
+  http://x/.DS_Store URL(自动下载后解析)
+
+示例:
+  dsstore .DS_Store
+  dsstore --notes http://x/.DS_Store
+  dsstore --recurse http://x/.DS_Store
+EOF
+    exit 1
+}
+
+[ $# -lt 1 ] && usage
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --notes)    NOTES=1; shift ;;
+        --recurse)  RECURSE=1; shift ;;
+        -h|--help)  usage ;;
+        --*)        echo "未知选项: $1" >&2; usage ;;
+        *)          INPUT="$1"; shift ;;
+    esac
+done
+[ -n "$INPUT" ] || usage
+
+case "$INPUT" in
+    http://*|https://*)
+        tmp=$(mktemp)
+        trap 'rm -f "$tmp"' EXIT
+        curl -s --max-time 10 "$INPUT" -o "$tmp" || { echo "下载失败: $INPUT" >&2; exit 1; }
+        IN_FILE="$tmp"
+        ;;
+    *)
+        IN_FILE="$INPUT"
+        [ -f "$IN_FILE" ] || { echo "文件不存在: $IN_FILE" >&2; exit 1; }
+        ;;
+esac
+
+PY=$(cat <<'PYEOF'
+import struct, sys
+
+def parse(data, want_notes):
+    if len(data) < 36:
+        sys.stderr.write("文件太短，不是 .DS_Store\n")
+        return
+    if data[4:8] != b'Bud1':
+        sys.stderr.write("警告: 魔数不是 Bud1，可能不是标准 .DS_Store\n")
+    names = []
+
+    # 叶子块记录: next_pointer(4B)+count(4B) 后跟 count 条记录
+    # 记录: len(4B大端, UTF-16 字符数) + name(2*len)
+    #       + structure_id(4B) + structure_type(4B) + data
+    def read_records(block, limit):
+        if len(block) < 8:
+            return
+        count, = struct.unpack_from('>I', block, 4)
+        if count > 10000:
+            return
+        pos = 8
+        for _ in range(count):
+            if pos + 8 > len(block):
+                break
+            length, = struct.unpack_from('>I', block, pos)
+            if length <= 0 or length > 512 or pos + 4 + 2 * length + 8 > len(block):
+                break
+            name = block[pos + 4:pos + 4 + 2 * length].decode('utf-16-be', 'replace')
+            pos += 4 + 2 * length
+            if pos + 8 > len(block):
+                break
+            sid = block[pos:pos + 4].decode('ascii', 'replace')
+            stype = block[pos + 4:pos + 8].decode('ascii', 'replace')
+            pos += 8
+            note = ''
+            if stype in ('ustr', 'cmmt', 'extn'):
+                if pos + 4 > len(block):
+                    break
+                blen, = struct.unpack_from('>I', block, pos)
+                pos += 4
+                if want_notes and sid == 'note' and pos + 2 * blen <= len(block):
+                    note = block[pos:pos + 2 * blen].decode('utf-16-be', 'replace')
+                pos += 2 * blen
+            elif stype == 'blob':
+                if pos + 4 > len(block):
+                    break
+                blen, = struct.unpack_from('>I', block, pos)
+                pos += 4 + blen
+            else:
+                skip_map = {'bool': 1, 'type': 4, 'long': 4, 'shor': 4,
+                            'comp': 8, 'dutc': 8, 'icgo': 8, 'lssp': 8,
+                            'modD': 8, 'moDD': 8, 'phyS': 8, 'ph1S': 8,
+                            'BKGD': 12, 'ICVO': 1, 'LSVO': 1, 'dscl': 1,
+                            'Iloc': 16, 'fwi0': 16, 'dilc': 32, 'lsvo': 76}
+                pos += skip_map.get(stype, 4)
+            if name:
+                names.append((name, sid, note))
+        return
+
+    try:
+        offset, = struct.unpack_from('>I', data, 8)
+        size, = struct.unpack_from('>I', data, 12)
+        offset2, = struct.unpack_from('>I', data, 16)
+        if offset != offset2 or offset + 4 + size > len(data):
+            raise ValueError('头部 offset 异常')
+        root = data[offset + 4:offset + 4 + size]
+        count, = struct.unpack_from('>I', root, 0)
+        if count > 0 and count < 65536:
+            pos = 8
+            addrs = []
+            for _ in range(count):
+                if pos + 4 > len(root):
+                    break
+                addr, = struct.unpack_from('>I', root, pos)
+                pos += 4
+                if addr:
+                    addrs.append(addr)
+            section_end = (count // 256 + 1) * 256 * 4 - count * 4
+            pos += section_end
+            if pos + 4 <= len(root):
+                toc_count, = struct.unpack_from('>I', root, pos)
+                pos += 4
+                toc = {}
+                for _ in range(min(toc_count, 128)):
+                    if pos + 1 > len(root):
+                        break
+                    tlen = root[pos]
+                    pos += 1
+                    if pos + tlen + 4 > len(root):
+                        break
+                    tname = root[pos:pos + tlen].decode('ascii', 'replace')
+                    block_id, = struct.unpack_from('>I', root, pos + tlen)
+                    toc[tname] = block_id
+                    pos += tlen + 4
+                if 'DSDB' in toc and toc['DSDB'] < len(addrs):
+                    addr = addrs[toc['DSDB']]
+                    boff = (addr >> 5) << 5
+                    bsize = 1 << (addr & 0x1f)
+                    block = data[boff + 4:boff + 4 + bsize]
+                    read_records(block, len(block))
+    except Exception as e:
+        sys.stderr.write(f"B-tree 解析失败({e})，回退扫描\n")
+
+    # 保底: 扫描 UTF-16BE 可读串（对齐后跟 type 标签）
+    if not names:
+        i = 0
+        n = len(data)
+        while i < n - 12:
+            if data[i] == 0 and 0x20 <= data[i + 1] < 0x7f:
+                j = i
+                s = []
+                while j < n - 1 and data[j] == 0 and 0x20 <= data[j + 1] < 0x7f:
+                    s.append(chr(data[j + 1]))
+                    j += 2
+                if len(s) >= 3:
+                    tag = data[j:j + 4].decode('ascii', 'replace')
+                    if tag in ('note', 'ustr', 'blob', 'long', 'bool'):
+                        names.append((''.join(s), tag, ''))
+                i = j
+            else:
+                i += 1
+
+    seen = set()
+    for name, sid, note in names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        if want_notes and note:
+            print(f"{name}\t(备注: {note})")
+        else:
+            print(name)
+
+data = open(sys.argv[1], 'rb').read()
+parse(data, len(sys.argv) > 2 and sys.argv[2] == '1')
+PYEOF
+)
+
+python3 - "$IN_FILE" "$NOTES" <<<"$PY"
+
+# 递归: URL 模式下, 把解析出的名字当子目录/文件继续抓
+if [ "$RECURSE" = 1 ]; then
+    case "$INPUT" in
+        http://*|https://*)
+            BASE_DIR="${INPUT%/*}"
+            walk_ds() { # $1=URL $2=深度
+                local url="$1" depth="$2" tmp3 names
+                [ "$depth" -gt 5 ] && return 0
+                tmp3=$(mktemp)
+                curl -s --max-time 8 "$url" -o "$tmp3" 2>/dev/null || { rm -f "$tmp3"; return 0; }
+                [ -s "$tmp3" ] || { rm -f "$tmp3"; return 0; }
+                echo
+                echo "[*] $(echo "$url" | sed 's|/\.DS_Store$||') 的 .DS_Store:"
+                python3 - "$tmp3" "$NOTES" <<<"$PY"
+                names=$(python3 - "$tmp3" <<'MAPEOF'
+import sys
+data = open(sys.argv[1], 'rb').read()
+out = set()
+i = 0
+n = len(data)
+while i < n - 2:
+    if data[i] == 0 and 0x20 <= data[i+1] < 0x7f:
+        j = i
+        while j < n - 1 and data[j] == 0 and 0x20 <= data[j+1] < 0x7f:
+            j += 2
+        if j - i >= 6:
+            out.add(data[i:j].decode('utf-16-be', 'replace'))
+        i = j
+    else:
+        i += 1
+print('\n'.join(sorted(out)))
+MAPEOF
+                )
+                rm -f "$tmp3"
+                while IFS= read -r name; do
+                    [ -z "$name" ] && continue
+                    case "$name" in
+                        *.*) continue ;;  # 带扩展名当文件, 跳过
+                    esac
+                    walk_ds "${url%/*}/$name/.DS_Store" "$((depth + 1))"
+                done <<<"$names"
+            }
+            walk_ds "$INPUT" 0
+            ;;
+    esac
+fi
