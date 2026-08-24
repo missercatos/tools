@@ -1,0 +1,1 @@
+{"rustc":7458672600737419911,"features":"[]","declared_features":"[\"large-dates\"]","target":10582047573009931897,"profile":6641356514038914190,"path":7019672603336639317,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"release/.fingerprint/time-core-e88072c15f7b794e/dep-lib-time_core","checksum":false}}],"rustflags":[],"config":8247474407144887393,"compile_kind":0}

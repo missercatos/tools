@@ -1,0 +1,15 @@
+[package]
+name = "brute"
+version = "0.1.0"
+edition = "2024"
+description = "Web 爆破终端：登录爆破 / 验证码闸门 / 会话轮换 / 已认证 REPL"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls"] }
+regex = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+url = "2"
