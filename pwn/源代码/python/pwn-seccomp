@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""pwn-seccomp: seccomp规则查看/分析
+用法:
+    pwn-seccomp <binary>                      # 分析二进制中的seccomp调用
+    pwn-seccomp --bpf <hex_bytes>             # 解析BPF字节码
+    pwn-seccomp --file <bpf_dump>             # 从文件解析BPF
+    pwn-seccomp --pwntools <pwntools_output>  # 解析pwntools的seccompTools输出
+    pwn-seccomp --list                        # 列出常用syscall号
+"""
+import struct, sys, subprocess, re
+
+# x86_64 syscall表
+SYSCALLS = {
+    0: "read", 1: "write", 2: "open", 3: "close", 4: "stat",
+    5: "fstat", 6: "lstat", 7: "poll", 8: "lseek", 9: "mmap",
+    10: "mprotect", 11: "munmap", 12: "brk", 13: "rt_sigaction",
+    14: "rt_sigprocmask", 16: "ioctl", 17: "pread64", 18: "pwrite64",
+    20: "writev", 21: "access", 22: "pipe", 24: "sched_yield",
+    32: "dup", 33: "dup2", 35: "nanosleep", 39: "getpid",
+    41: "socket", 42: "connect", 43: "accept", 49: "bind",
+    50: "listen", 56: "clone", 57: "fork", 59: "execve",
+    60: "exit", 61: "wait4", 62: "kill", 63: "uname",
+    72: "fcntl", 78: "getdents", 79: "getcwd", 82: "rename",
+    83: "mkdir", 87: "unlink", 89: "readlink", 90: "chmod",
+    102: "getuid", 104: "getgid", 107: "geteuid", 108: "getegid",
+    158: "arch_prctl", 217: "getdents64", 231: "exit_group",
+    257: "openat", 262: "newfstatat", 302: "prlimit64",
+    318: "getrandom", 332: "statx", 334: "rseq",
+}
+
+# BPF指令
+BPF_LD   = 0x00
+BPF_JMP  = 0x05
+BPF_RET  = 0x06
+BPF_W    = 0x00
+BPF_H    = 0x08
+BPF_B    = 0x10
+BPF_ABS  = 0x20
+BPF_JEQ  = 0x10
+BPF_JGE  = 0x30
+BPF_JGT  = 0x20
+BPF_JSET = 0x40
+BPF_K    = 0x00
+
+# seccomp actions
+SCMP_ACT_KILL  = 0x00000000
+SCMP_ACT_TRAP  = 0x00030000
+SCMP_ACT_ERRNO = 0x00050000
+SCMP_ACT_TRACE = 0x00040000
+SCMP_ACT_ALLOW = 0x7fff0000
+SCMP_ACT_LOG   = 0x7ffc0000
+SCMP_ACT_MASK  = 0xffff0000
+
+def parse_bpf(bpf_bytes):
+    """解析seccomp BPF字节码"""
+    if len(bpf_bytes) % 8 != 0:
+        bpf_bytes = bpf_bytes + b'\x00' * (8 - len(bpf_bytes) % 8)
+    
+    rules = []
+    i = 0
+    while i + 8 <= len(bpf_bytes):
+        code = struct.unpack('<H', bpf_bytes[i:i+2])[0]
+        jt = bpf_bytes[i+2]
+        jf = bpf_bytes[i+3]
+        k = struct.unpack('<I', bpf_bytes[i+4:i+8])[0]
+        
+        op = code & 0x07
+        size = code & 0x18
+        mode = code & 0xe0
+        
+        rule = {'offset': i, 'code': code, 'jt': jt, 'jf': jf, 'k': k}
+        
+        if op == BPF_RET:
+            action = k & SCMP_ACT_MASK
+            if action == SCMP_ACT_ALLOW:
+                rule['action'] = 'ALLOW'
+            elif action == SCMP_ACT_KILL:
+                rule['action'] = 'KILL'
+            elif action == SCMP_ACT_TRAP:
+                rule['action'] = 'TRAP'
+            elif action == SCMP_ACT_ERRNO:
+                errno_val = k & 0x0000ffff
+                rule['action'] = f'ERRNO({errno_val})'
+            elif action == SCMP_ACT_TRACE:
+                rule['action'] = 'TRACE'
+            elif action == SCMP_ACT_LOG:
+                rule['action'] = 'LOG'
+            else:
+                rule['action'] = f'UNKNOWN(0x{k:x})'
+        elif op == BPF_JMP:
+            jmp_type = code & 0xf0
+            if jmp_type == BPF_JEQ:
+                rule['op'] = f'JEQ 0x{k:x}'
+            elif jmp_type == BPF_JGE:
+                rule['op'] = f'JGE 0x{k:x}'
+            elif jmp_type == BPF_JGT:
+                rule['op'] = f'JGT 0x{k:x}'
+            elif jmp_type == BPF_JSET:
+                rule['op'] = f'JSET 0x{k:x}'
+            else:
+                rule['op'] = f'JMP 0x{k:x}'
+        elif op == BPF_LD:
+            if mode == BPF_ABS:
+                if size == BPF_W:
+                    rule['op'] = f'LD [data_width:4 + 0x{k:x}]'
+                elif size == BPF_H:
+                    rule['op'] = f'LD [data_width:2 + 0x{k:x}]'
+                elif size == BPF_B:
+                    rule['op'] = f'LD [data_width:1 + 0x{k:x}]'
+            elif mode == BPF_W:
+                rule['op'] = f'LD 0x{k:x}'
+        
+        rules.append(rule)
+        i += 8
+    
+    return rules
+
+def print_bpf_rules(rules):
+    """格式化输出BPF规则"""
+    print(f"[*] Parsed {len(rules)} BPF instructions:\n")
+    print(f"{'Offset':>8}  {'Code':>6}  {'JT':>3}  {'JF':>3}  {'K':>10}  Description")
+    print("-" * 65)
+    
+    for r in rules:
+        desc = r.get('op', '') or r.get('action', '')
+        # 关联syscall名称
+        if 'k' in r and r.get('op', '').startswith('JEQ'):
+            syscall_name = SYSCALLS.get(r['k'], f'syscall_{r["k"]}')
+            desc += f'  -> {syscall_name}'
+        
+        print(f"0x{r['offset']:06x}  0x{r['code']:04x}  {r['jt']:3d}  {r['jf']:3d}  0x{r['k']:08x}  {desc}")
+
+def analyze_binary_seccomp(binary):
+    """分析二进制文件中的seccomp调用"""
+    print(f"[*] Scanning {binary} for seccomp patterns...\n")
+    
+    # 搜索seccomp相关字符串
+    try:
+        strings_out = subprocess.check_output(
+            ['strings', binary], stderr=subprocess.DEVNULL, text=True
+        )
+        patterns = ['seccomp', 'SECCOMP', 'prctl', 'PR_SET_SECCOMP', 'seccomp_rule_add']
+        for pat in patterns:
+            for i, line in enumerate(strings_out.splitlines()):
+                if pat.lower() in line.lower():
+                    print(f"  [strings] {line}")
+    except:
+        pass
+    
+    # 搜索 prctl 调用 (syscall 158 on x86_64)
+    try:
+        objdump = subprocess.check_output(
+            ['objdump', '-d', binary], stderr=subprocess.DEVNULL, text=True
+        )
+        in_main = False
+        for line in objdump.splitlines():
+            if 'prctl' in line.lower() or 'seccomp' in line.lower():
+                print(f"  [disasm] {line.strip()}")
+            # 搜索 mov eax, 158 (prctl syscall号)
+            if 'mov' in line and ('eax' in line or 'rax' in line) and '158' in line:
+                print(f"  [disasm] {line.strip()}")
+    except:
+        pass
+    
+    print("\n[*] 如需精确分析BPF, 用: pwn-seccomp --bpf <hex_bytes>")
+    print("    或用 pwntools: pwn.pwnlib.seccomp SeccompWindow()")
+
+def parse_pwntools_output(text):
+    """解析pwntools seccomp-tools的输出"""
+    print("[*] Parsed seccomp rules from pwntools output:\n")
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if 'ALLOW' in line or 'KILL' in line or 'ERRNO' in line:
+            # 提取syscall
+            parts = line.split()
+            if parts:
+                name = parts[0]
+                syscalls = [SYSCALLS.get(i, str(i)) for i in range(400)]
+                print(f"  {line}")
+        else:
+            print(f"  {line}")
+
+def list_syscalls():
+    """列出常用syscall"""
+    print("[*] x86_64 syscall表 (常用):\n")
+    for num, name in sorted(SYSCALLS.items()):
+        print(f"  {num:4d}  0x{num:03x}  {name}")
+    print(f"\n  ... 共 {len(SYSCALLS)} 个")
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    
+    if cmd == '--list':
+        list_syscalls()
+    elif cmd == '--bpf':
+        hex_str = sys.argv[2].replace(' ', '').replace('\\x', '').replace('0x', '')
+        bpf_bytes = bytes.fromhex(hex_str)
+        rules = parse_bpf(bpf_bytes)
+        print_bpf_rules(rules)
+    elif cmd == '--file':
+        with open(sys.argv[2], 'rb') as f:
+            bpf_bytes = f.read()
+        rules = parse_bpf(bpf_bytes)
+        print_bpf_rules(rules)
+    elif cmd == '--pwntools':
+        if len(sys.argv) > 2:
+            text = ' '.join(sys.argv[2:])
+        else:
+            text = sys.stdin.read()
+        parse_pwntools_output(text)
+    else:
+        # 假设是二进制文件路径
+        import os
+        if os.path.isfile(cmd):
+            analyze_binary_seccomp(cmd)
+        else:
+            print(f"[-] Unknown command or file: {cmd}")
+            print(__doc__)
+
+if __name__ == '__main__':
+    main()

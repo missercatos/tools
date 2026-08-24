@@ -1,0 +1,110 @@
+#!/bin/bash
+# pwn-checksec: 纯bash检查ELF二进制保护
+# 依赖: xxd (或 od), readelf, nm
+# 用法: pwn-checksec <binary>
+
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+BOLD='\033[1m'; RESET='\033[0m'
+
+ok()   { printf "${GREEN}[+]${RESET} %-12s %s\n" "$1" "$2"; }
+warn() { printf "${YELLOW}[!]${RESET} %-12s %s\n" "$1" "$2"; }
+fail() { printf "${RED}[-]${RESET} %-12s %s\n" "$1" "$2"; }
+
+usage() { echo "Usage: $0 <binary>"; exit 1; }
+
+[[ $# -lt 1 ]] && usage
+FILE="$1"
+[[ ! -f "$FILE" ]] && { echo "[-] File not found: $FILE"; exit 1; }
+[[ ! -x "$FILE" ]] && warn "NOT_EXEC" "File is not executable"
+[[ ! -r "$FILE" ]] && { echo "[-] Cannot read: $FILE"; exit 1; }
+
+# 检查是否为ELF
+MAGIC=$(xxd -p -l 4 "$FILE" 2>/dev/null)
+[[ "$MAGIC" != "7f454c46" ]] && { echo "[-] Not an ELF file"; exit 1; }
+
+ARCH=$(xxd -p -s 4 -l 1 "$FILE" 2>/dev/null)
+Bitness=$(xxd -p -s 18 -l 2 "$FILE" 2>/dev/null)
+
+printf "${BOLD}[*] %s${RESET}\n" "$FILE"
+printf "    Arch: "
+case "$ARCH" in
+    01) printf "32-bit" ;;
+    02) printf "64-bit" ;;
+    *)  printf "unknown" ;;
+esac
+printf " | "
+case "$Bitness" in
+    0300) printf "x86\n" ;;
+    3e00) printf "x86_64\n" ;;
+    2800) printf "ARM\n" ;;
+    b700) printf "AArch64\n" ;;
+    *)    printf "0x%s\n" "$Bitness" ;;
+esac
+
+# NX: 检查 PT_GNU_STACK (type 0x6474e551) 的权限
+NX_FOUND=0
+NX_VAL=$(readelf -l "$FILE" 2>/dev/null | grep -A1 GNU_STACK | grep -oP '0x[0-9a-f]+' | head -1 || true)
+if [[ -n "$NX_VAL" ]]; then
+    # 如果有 GNU_STACK 且权限不含 E，则NX开启
+    NX_LINE=$(readelf -l "$FILE" 2>/dev/null | grep GNU_STACK || true)
+    if [[ -n "$NX_LINE" ]]; then
+        if echo "$NX_LINE" | grep -q 'RWE\| E '; then
+            fail "NX" "Disabled (stack executable)"
+        else
+            ok "NX" "Enabled"
+            NX_FOUND=1
+        fi
+    fi
+else
+    warn "NX" "No PT_GNU_STACK found (legacy binary?)"
+fi
+[[ $NX_FOUND -eq 0 && -n "$NX_VAL" ]] && { true; } # NX已判断
+
+# PIE: 检查 ELF type
+ET_TYPE=$(xxd -p -s 16 -l 2 "$FILE" 2>/dev/null)
+case "$ET_TYPE" in
+    0200) fail "PIE" "Disabled (ET_EXEC)" ;;
+    0300) ok "PIE" "Enabled (ET_DYN)" ;;
+    0400) warn "PIE" "Core dump (ET_CORE)" ;;
+    *)    warn "PIE" "Unknown type 0x$ET_TYPE" ;;
+esac
+
+# RELRO: 检查 GNU_RELRO + BIND_NOW
+RELRO_LINE=$(readelf -l "$FILE" 2>/dev/null | grep GNU_RELRO || true)
+DYNAMIC_LINE=$(readelf -d "$FILE" 2>/dev/null | grep -i 'BIND_NOW\|FLAGS' || true)
+
+if [[ -n "$RELRO_LINE" ]]; then
+    if echo "$DYNAMIC_LINE" | grep -q 'BIND_NOW'; then
+        ok "RELRO" "Full RELRO"
+    else
+        warn "RELRO" "Partial RELRO"
+    fi
+else
+    fail "RELRO" "No RELRO"
+fi
+
+# Stack Canary: 检查 __stack_chk_fail
+CANARY=$(nm -D "$FILE" 2>/dev/null | grep '__stack_chk_fail' || true)
+if [[ -n "$CANARY" ]]; then
+    ok "Canary" "Enabled"
+else
+    fail "Canary" "Disabled"
+fi
+
+# FORTIFY: 检查 __*_chk 符号
+FORTIFY=$(nm -D "$FILE" 2>/dev/null | grep -c '__.*_chk@' || true)
+if [[ "$FORTIFY" -gt 0 ]]; then
+    ok "FORTIFY" "Enabled (${FORTIFY} functions)"
+else
+    fail "FORTIFY" "Disabled"
+fi
+
+# RWX segments
+RWX=$(readelf -l "$FILE" 2>/dev/null | grep 'RWE' || true)
+if [[ -n "$RWX" ]]; then
+    warn "RWX" "Found writable+executable segments"
+else
+    ok "RWX" "No RWX segments"
+fi

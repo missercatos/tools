@@ -1,0 +1,126 @@
+#!/bin/bash
+# misc-extract: 嵌套压缩包自动解压
+# 用法: misc-extract <file> [outdir]
+# 支持: zip, tar, gz, bz2, xz, 7z, rar
+
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+BOLD='\033[1m'; RESET='\033[0m'
+
+[[ $# -lt 1 ]] && { echo "Usage: $0 <archive> [outdir]"; exit 1; }
+
+FILE="$1"
+OUTDIR="${2:-$(basename "$FILE" | sed 's/\.[^.]*$//')}_extracted"
+MAX_DEPTH=50
+
+mkdir -p "$OUTDIR"
+
+echo -e "${BOLD}[*] Extracting: $FILE${RESET}"
+echo -e "    Output: $OUTDIR"
+
+# Try extraction methods
+extract_file() {
+    local f="$1"
+    local out="$2"
+    local base=$(basename "$f")
+    local ext="${base##*.}"
+    local lower_ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+
+    case "$lower_ext" in
+        zip)
+            unzip -o -q "$f" -d "$out" 2>/dev/null && return 0
+            # Try password recovery
+            unzip -o -q -P "" "$f" -d "$out" 2>/dev/null && return 0
+            return 1
+            ;;
+        tar)
+            tar xf "$f" -C "$out" 2>/dev/null && return 0
+            return 1
+            ;;
+        gz|tgz|tar.gz)
+            tar xzf "$f" -C "$out" 2>/dev/null && return 0
+            gunzip -c "$f" > "$out/${base%.gz}" 2>/dev/null && return 0
+            return 1
+            ;;
+        bz2|tbz2|tar.bz2)
+            tar xjf "$f" -C "$out" 2>/dev/null && return 0
+            bunzip2 -c "$f" > "$out/${base%.bz2}" 2>/dev/null && return 0
+            return 1
+            ;;
+        xz|txz|tar.xz)
+            tar xJf "$f" -C "$out" 2>/dev/null && return 0
+            unxz -c "$f" > "$out/${base%.xz}" 2>/dev/null && return 0
+            return 1
+            ;;
+        7z)
+            7z x "$f" -o"$out" -y 2>/dev/null && return 0
+            return 1
+            ;;
+        rar)
+            unrar x "$f" "$out/" -y 2>/dev/null && return 0
+            return 1
+            ;;
+    esac
+
+    # Try file command
+    local ftype=$(file -b "$f" 2>/dev/null)
+    case "$ftype" in
+        *gzip*) tar xzf "$f" -C "$out" 2>/dev/null && return 0 ;;
+        *bzip2*) tar xjf "$f" -C "$out" 2>/dev/null && return 0 ;;
+        *XZ*) tar xJf "$f" -C "$out" 2>/dev/null && return 0 ;;
+        *"Zip archive"*) unzip -o -q "$f" -d "$out" 2>/dev/null && return 0 ;;
+        *"7-zip"*) 7z x "$f" -o"$out" -y 2>/dev/null && return 0 ;;
+        *"RAR archive"*) unrar x "$f" "$out/" -y 2>/dev/null && return 0 ;;
+    esac
+
+    return 1
+}
+
+depth=0
+current_dir="$OUTDIR"
+
+# Copy original file to outdir
+cp "$FILE" "$OUTDIR/" 2>/dev/null || true
+
+while [ $depth -lt $MAX_DEPTH ]; do
+    found=0
+
+    # Find all archives in current directory
+    while IFS= read -r -d '' archive; do
+        extract_dir="${archive}_extracted"
+        mkdir -p "$extract_dir"
+
+        if extract_file "$archive" "$extract_dir"; then
+            echo -e "  ${GREEN}[+] Depth $depth:${RESET} $(basename "$archive") -> $extract_dir"
+            found=1
+            # Remove archive after extraction
+            rm -f "$archive" 2>/dev/null
+        else
+            echo -e "  ${YELLOW}[!] Depth $depth:${RESET} Failed to extract: $(basename "$archive")"
+            rmdir "$extract_dir" 2>/dev/null || true
+        fi
+    done < <(find "$current_dir" -maxdepth 1 -type f \( \
+        -name "*.zip" -o -name "*.tar" -o -name "*.gz" -o -name "*.tgz" \
+        -o -name "*.bz2" -o -name "*.xz" -o -name "*.7z" -o -name "*.rar" \
+        -o -name "*.tar.gz" -o -name "*.tar.bz2" -o -name "*.tar.xz" \
+    \) -print0 2>/dev/null)
+
+    if [ $found -eq 0 ]; then
+        break
+    fi
+
+    depth=$((depth + 1))
+    current_dir="$OUTDIR"
+done
+
+echo -e "\n${BOLD}[*] Done.${RESET} Extracted to: $OUTDIR"
+echo -e "    Depth: $depth"
+echo -e "    Files:"
+find "$OUTDIR" -type f | head -20 | while read -r f; do
+    echo -e "      $f"
+done
+total=$(find "$OUTDIR" -type f | wc -l)
+if [ "$total" -gt 20 ]; then
+    echo -e "      ... and $((total - 20)) more"
+fi

