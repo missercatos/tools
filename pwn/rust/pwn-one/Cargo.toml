@@ -1,0 +1,15 @@
+[package]
+name = "pwn-one"
+version = "0.1.0"
+edition = "2021"
+description = "one_gadget查找 (PWN tool)"
+
+[dependencies]
+goblin = "0.8"
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
