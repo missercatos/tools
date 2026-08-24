@@ -1,0 +1,264 @@
+#!/bin/bash
+# ctfhelp - CTF工具集方向导航
+# 用法: ctfhelp [方向] [--search 关键词]
+
+BOLD='\033[1m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 工具描述: 工具名|中文描述
+declare -A TOOL_DESC=(
+    # Web - 信息泄露
+    [trav]="目录遍历(内置字典/wildcard过滤/限速)"
+    [dumpvcs]="VCS泄露恢复(git/hg/svn自动识别+flag扫描)"
+    [gitdump]=".git目录泄露恢复"
+    [githack]="GitHack风格.git泄露利用+flag扫描"
+    [hgdump]=".hg泄露利用"
+    [svndump]=".svn泄露利用"
+    [dsstore]=".DS_Store解析(支持递归URL)"
+    # Web - 爆破
+    [brute]="Web登录爆破终端(Rust，验证码/会话轮换/代理)"
+    # Web - 注入
+    [sqli]="SQL注入检测(布尔/时间盲注+数据提取)"
+    [lfi]="文件包含探测(php://filter/日志投毒)"
+    [ssti]="模板注入检测+payload字典"
+    [cmdi]="命令注入payload+反弹shell生成"
+    # Web - 认证绕过
+    [jwt]="JWT解码/伪造(alg none/HS256)/弱密钥爆破"
+    # Web - 杂项
+    [encdec]="编码转换(url/base64/hex/rot13/html/unicode/gzip)"
+    [xssserv]="XSS回调服务器(cookie/路径捕获)"
+    # PWN - 保护检测
+    [checksec]="纯bash ELF保护检测(NX/PIE/canary/RELRO)"
+    [libc-sym]="libc符号偏移查询"
+    # PWN - ELF分析
+    [elf]="ELF解析+保护检测(Rust)"
+    # PWN - 堆利用
+    [heap]="堆块元数据解析(Rust)"
+    [one]="one_gadget查找(libc中execve /bin/sh)"
+    # PWN - 格式串攻击
+    [got]="GOT覆写计算器(格式串攻击辅助)"
+    [fmt]="格式串payload生成器(%p/%n/%s)"
+    [offset]="溢出偏移计算器(ret/canary/ret2libc)"
+    # PWN - 漏洞利用
+    [shell]="shellcode/反弹shell生成器(x86/x64)"
+    [gdb-gen]="GDB exploit脚本生成器"
+    [seccomp]="seccomp BPF规则分析器"
+    # MISC - 文件分析
+    [analyze]="文件综合分析(magic/熵/元数据/隐藏数据)"
+    [filetype]="快速文件类型检测(magic number)"
+    # MISC - 隐写检测
+    [stego]="图片隐写检测(LSB/通道/metadata)"
+    # MISC - 数据可视化
+    [entropy]="熵可视化(PNG热力图+ASCII art)"
+    [visual]="二进制数据可视化(发现数据规律)"
+    # MISC - 密码分析
+    [xor]="XOR分析/爆破(单字节/多字节/已知明文)"
+    # MISC - 文件恢复
+    [carve]="文件雕刻(扫描magic恢复文件)"
+    # MISC - 压缩解压
+    [extract]="嵌套压缩包自动解压"
+    # MISC - 二维码
+    [qr]="QR码生成(ASCII art+PNG)"
+    # MISC - 流量分析
+    [pcap]="PCAP解析(提取HTTP/DNS/文件)"
+    # MISC - 音频分析
+    [spectro]="频谱图生成(sox/ffmpeg wrapper)"
+)
+
+print_tree() {
+    local dir="$1"
+    local prefix="$2"
+    local is_last="$3"
+
+    if [ "$is_last" = "1" ]; then
+        echo -e "${prefix}└── "
+    else
+        echo -e "${prefix}├── "
+    fi
+}
+
+show_web() {
+    local p="${1}"
+    echo -e "${p}${WHITE}Web安全${RESET} ${DIM}(${GREEN}15${RESET}${DIM}个工具)${RESET}"
+
+    # 信息泄露
+    echo -e "${p}├── ${CYAN}信息泄露${RESET} ${DIM}(7)${RESET}"
+    local tools=("trav" "dumpvcs" "gitdump" "githack" "hgdump" "svndump" "dsstore")
+    for i in "${!tools[@]}"; do
+        local t="${tools[$i]}"
+        local desc="${TOOL_DESC[$t]}"
+        if [ $i -eq $((${#tools[@]}-1)) ]; then
+            echo -e "${p}│   └── ${GREEN}${t}${RESET}  ${DIM}${desc}${RESET}"
+        else
+            echo -e "${p}│   ├── ${GREEN}${t}${RESET}  ${DIM}${desc}${RESET}"
+        fi
+    done
+
+    # 爆破
+    echo -e "${p}├── ${CYAN}爆破${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}brute${RESET}  ${DIM}${TOOL_DESC[brute]}${RESET}"
+
+    # 注入
+    echo -e "${p}├── ${CYAN}注入${RESET} ${DIM}(4)${RESET}"
+    local tools=("sqli" "lfi" "ssti" "cmdi")
+    for i in "${!tools[@]}"; do
+        local t="${tools[$i]}"
+        local desc="${TOOL_DESC[$t]}"
+        if [ $i -eq $((${#tools[@]}-1)) ]; then
+            echo -e "${p}│   └── ${GREEN}${t}${RESET}  ${DIM}${desc}${RESET}"
+        else
+            echo -e "${p}│   ├── ${GREEN}${t}${RESET}  ${DIM}${desc}${RESET}"
+        fi
+    done
+
+    # 认证绕过
+    echo -e "${p}├── ${CYAN}认证绕过${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}jwt${RESET}  ${DIM}${TOOL_DESC[jwt]}${RESET}"
+
+    # 杂项
+    echo -e "${p}└── ${CYAN}杂项${RESET} ${DIM}(2)${RESET}"
+    echo -e "${p}    ├── ${GREEN}encdec${RESET}  ${DIM}${TOOL_DESC[encdec]}${RESET}"
+    echo -e "${p}    └── ${GREEN}xssserv${RESET}  ${DIM}${TOOL_DESC[xssserv]}${RESET}"
+}
+
+show_pwn() {
+    local p="${1}"
+    echo -e "\n${p}${WHITE}PWN 二进制漏洞利用${RESET} ${DIM}(${GREEN}11${RESET}${DIM}个工具)${RESET}"
+
+    # 保护检测
+    echo -e "${p}├── ${CYAN}保护检测${RESET} ${DIM}(2)${RESET}"
+    echo -e "${p}│   ├── ${GREEN}checksec${RESET}  ${DIM}${TOOL_DESC[checksec]}${RESET}"
+    echo -e "${p}│   └── ${GREEN}libc-sym${RESET}  ${DIM}${TOOL_DESC[libc-sym]}${RESET}"
+
+    # ELF分析
+    echo -e "${p}├── ${CYAN}ELF分析${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}elf${RESET}  ${DIM}${TOOL_DESC[elf]}${RESET}"
+
+    # 堆利用
+    echo -e "${p}├── ${CYAN}堆利用${RESET} ${DIM}(2)${RESET}"
+    echo -e "${p}│   ├── ${GREEN}heap${RESET}  ${DIM}${TOOL_DESC[heap]}${RESET}"
+    echo -e "${p}│   └── ${GREEN}one${RESET}  ${DIM}${TOOL_DESC[one]}${RESET}"
+
+    # 格式串攻击
+    echo -e "${p}├── ${CYAN}格式串攻击${RESET} ${DIM}(3)${RESET}"
+    echo -e "${p}│   ├── ${GREEN}got${RESET}  ${DIM}${TOOL_DESC[got]}${RESET}"
+    echo -e "${p}│   ├── ${GREEN}fmt${RESET}  ${DIM}${TOOL_DESC[fmt]}${RESET}"
+    echo -e "${p}│   └── ${GREEN}offset${RESET}  ${DIM}${TOOL_DESC[offset]}${RESET}"
+
+    # 漏洞利用
+    echo -e "${p}└── ${CYAN}漏洞利用${RESET} ${DIM}(3)${RESET}"
+    echo -e "${p}    ├── ${GREEN}shell${RESET}  ${DIM}${TOOL_DESC[shell]}${RESET}"
+    echo -e "${p}    ├── ${GREEN}gdb-gen${RESET}  ${DIM}${TOOL_DESC[gdb-gen]}${RESET}"
+    echo -e "${p}    └── ${GREEN}seccomp${RESET}  ${DIM}${TOOL_DESC[seccomp]}${RESET}"
+}
+
+show_misc() {
+    local p="${1}"
+    echo -e "\n${p}${WHITE}MISC 杂项${RESET} ${DIM}(${GREEN}11${RESET}${DIM}个工具)${RESET}"
+
+    # 文件分析
+    echo -e "${p}├── ${CYAN}文件分析${RESET} ${DIM}(2)${RESET}"
+    echo -e "${p}│   ├── ${GREEN}analyze${RESET}  ${DIM}${TOOL_DESC[analyze]}${RESET}"
+    echo -e "${p}│   └── ${GREEN}filetype${RESET}  ${DIM}${TOOL_DESC[filetype]}${RESET}"
+
+    # 隐写检测
+    echo -e "${p}├── ${CYAN}隐写检测${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}stego${RESET}  ${DIM}${TOOL_DESC[stego]}${RESET}"
+
+    # 数据可视化
+    echo -e "${p}├── ${CYAN}数据可视化${RESET} ${DIM}(2)${RESET}"
+    echo -e "${p}│   ├── ${GREEN}entropy${RESET}  ${DIM}${TOOL_DESC[entropy]}${RESET}"
+    echo -e "${p}│   └── ${GREEN}visual${RESET}  ${DIM}${TOOL_DESC[visual]}${RESET}"
+
+    # 密码分析
+    echo -e "${p}├── ${CYAN}密码分析${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}xor${RESET}  ${DIM}${TOOL_DESC[xor]}${RESET}"
+
+    # 文件恢复
+    echo -e "${p}├── ${CYAN}文件恢复${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}carve${RESET}  ${DIM}${TOOL_DESC[carve]}${RESET}"
+
+    # 压缩解压
+    echo -e "${p}├── ${CYAN}压缩解压${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}extract${RESET}  ${DIM}${TOOL_DESC[extract]}${RESET}"
+
+    # 二维码
+    echo -e "${p}├── ${CYAN}二维码${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}qr${RESET}  ${DIM}${TOOL_DESC[qr]}${RESET}"
+
+    # 流量分析
+    echo -e "${p}├── ${CYAN}流量分析${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}│   └── ${GREEN}pcap${RESET}  ${DIM}${TOOL_DESC[pcap]}${RESET}"
+
+    # 音频分析
+    echo -e "${p}└── ${CYAN}音频分析${RESET} ${DIM}(1)${RESET}"
+    echo -e "${p}    └── ${GREEN}spectro${RESET}  ${DIM}${TOOL_DESC[spectro]}${RESET}"
+}
+
+search_tools() {
+    local keyword="$1"
+    echo -e "${WHITE}搜索: ${keyword}${RESET}\n"
+    local found=0
+    for tool in "${!TOOL_DESC[@]}"; do
+        local desc="${TOOL_DESC[$tool]}"
+        if [[ "$tool" == *"$keyword"* ]] || [[ "$desc" == *"$keyword"* ]]; then
+            echo -e "  ${GREEN}${tool}${RESET}  ${DIM}${desc}${RESET}"
+            found=$((found+1))
+        fi
+    done
+    echo -e "\n${DIM}找到 ${found} 个工具${RESET}"
+}
+
+show_usage() {
+    echo -e "${WHITE}CTF 工具集${RESET} ${DIM}v1.0${RESET}"
+    echo -e "${DIM}用法:${RESET}"
+    echo -e "  ctfhelp              显示完整工具树"
+    echo -e "  ctfhelp --web        只看Web方向"
+    echo -e "  ctfhelp --pwn        只看PWN方向"
+    echo -e "  ctfhelp --misc       只看MISC方向"
+    echo -e "  ctfhelp --search xx  搜索工具"
+    echo -e "  ctfhelp --list       列出所有工具名"
+    echo -e "  ctfhelp --help       显示此帮助"
+}
+
+# 主逻辑
+case "${1:-}" in
+    --help|-h)
+        show_usage
+        ;;
+    --web)
+        show_web "  "
+        ;;
+    --pwn)
+        show_pwn "  "
+        ;;
+    --misc)
+        show_misc "  "
+        ;;
+    --search|-s)
+        shift
+        search_tools "${1:-}"
+        ;;
+    --list|-l)
+        for tool in $(echo "${!TOOL_DESC[@]}" | tr ' ' '\n' | sort); do
+            echo -e "${GREEN}${tool}${RESET}"
+        done
+        ;;
+    *)
+        echo -e "\n  ${WHITE}CTF 工具集${RESET} ${DIM}共$((${#TOOL_DESC[@]}))个工具${RESET}\n"
+        show_web "  "
+        show_pwn "  "
+        show_misc "  "
+        echo -e "\n${DIM}提示: ctfhelp --search <关键词> 搜索 | ctfhelp --web 只看某个方向${RESET}\n"
+        ;;
+esac
