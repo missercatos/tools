@@ -24,6 +24,7 @@ web/                    Web安全工具
     brute               Web登录爆破终端(Rust，支持验证码/会话轮换/用户枚举/代理)
   注入/
     sqli                SQL注入检测(布尔/时间盲注+数据提取)
+    sqlinject           SQL注入自动化(zipapp单文件: 五步方法论一键化, GET/POST/Cookie/UA/Referer五注入点+布尔/时间盲注+8种tamper)
     lfi                 文件包含探测(php://filter/日志投毒)
     ssti                模板注入检测+payload字典
     cmdi                命令注入payload+反弹shell生成+TCP监听
@@ -34,6 +35,7 @@ web/                    Web安全工具
     xssserv             XSS回调服务器(cookie/路径捕获)
   源代码/
     brute/              Rust源码(cargo项目)
+    sqlinject/          sqlinject Python源码包(cli/detector/extractor/blind/bypass/utils)
 
 pwn/                    二进制漏洞利用工具
   保护检测/
