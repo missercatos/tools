@@ -1,0 +1,18 @@
+[package]
+name = "checksec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ELF 保护检测 (NX/PIE/RELRO/Canary/FORTIFY/RWX)"
+
+[dependencies]
+common = { workspace = true }
+clap = { workspace = true }
+colored = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+goblin = { workspace = true }
+
+[[bin]]
+name = "checksec"
+path = "src/main.rs"

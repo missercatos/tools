@@ -1,0 +1,18 @@
+[package]
+name = "hgdump"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { workspace = true, features = ["http"] }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+flate2 = { workspace = true }
+sha1 = { workspace = true }
+zstd = "0.13"
+
+[[bin]]
+name = "hgdump"
+path = "src/main.rs"

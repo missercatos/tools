@@ -1,0 +1,7 @@
+/home/a/hackingtools/源代码/rust/target/release/deps/filetype-395fdd12696f4ab7.d: filetype/src/main.rs
+
+/home/a/hackingtools/源代码/rust/target/release/deps/filetype-395fdd12696f4ab7: filetype/src/main.rs
+
+filetype/src/main.rs:
+
+# env-dep:CARGO_PKG_VERSION=2.0.0

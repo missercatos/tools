@@ -1,0 +1,14 @@
+/home/a/hackingtools/源代码/rust/target/release/deps/scroll-7739f11f797cb2cb.d: /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/lib.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/ctx.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/endian.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/error.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/greater.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/leb128.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/lesser.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/pread.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/pwrite.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/../README.md
+
+/home/a/hackingtools/源代码/rust/target/release/deps/libscroll-7739f11f797cb2cb.rmeta: /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/lib.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/ctx.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/endian.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/error.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/greater.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/leb128.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/lesser.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/pread.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/pwrite.rs /home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/../README.md
+
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/lib.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/ctx.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/endian.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/error.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/greater.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/leb128.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/lesser.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/pread.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/pwrite.rs:
+/home/a/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scroll-0.12.0/src/../README.md:

@@ -1,0 +1,19 @@
+[package]
+name = "jwt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JWT 解码/伪造/算法混淆/弱密钥爆破"
+
+[dependencies]
+common = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+
+[[bin]]
+name = "jwt"
+path = "src/main.rs"

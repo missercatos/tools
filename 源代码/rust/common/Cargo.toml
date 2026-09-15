@@ -1,0 +1,17 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hackingtools 共享库: 退出码 / 输出模式 / HTTP / flag扫描"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+colored = { workspace = true }
+regex = { workspace = true }
+ureq = { workspace = true, optional = true }
+
+[features]
+default = []
+http = ["ureq"]
