@@ -306,6 +306,7 @@ fn msfvenom_gen(out: &Out, payload: &str, opts: &[String]) -> Result<(), u8> {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     // --msfvenom 允许带连字符的透传参数, 会吞掉后面的 --json, 因此先剥离
     let mut json = false;
     let argv: Vec<String> = std::env::args()

@@ -237,6 +237,7 @@ fn load_entries(conn: &Connection) -> (Vec<EntryRow>, Option<String>) {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let args = Args::parse();
     let out = Out::new(Mode::from_flag(args.json));
 

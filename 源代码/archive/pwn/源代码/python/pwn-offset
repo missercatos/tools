@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""pwn-offset: PWN偏移计算器
+用法:
+    pwn-offset --overflow <buf_size> <ret_offset>   # 计算溢出偏移
+    pwn-offset --canary <buf_size> <canary_offset>  # canary偏移
+    pwn-offset --ret2libc <libc_base> <func_off>    # ret2libc地址
+    pwn-offset --rop-gadget <binary> <gadget_str>    # 查找gadget地址
+    pwn-offset --calc <expr>                         # 地址计算
+    pwn-offset --diff <addr1> <addr2>                # 两个地址差值
+"""
+import struct, sys, subprocess
+
+def overflow_calc(buf_size, ret_offset):
+    """计算溢出偏移"""
+    print(f"[*] Buffer size: {buf_size} bytes")
+    print(f"[*] Return address offset: {ret_offset}")
+    print(f"[*] Payload structure:")
+    print(f"    [padding: {ret_offset} bytes] [saved rbp: 8 bytes] [ret addr]")
+    print(f"    Total to ret: {ret_offset + 8} bytes")
+    print(f"    Full payload: {ret_offset + 8 + 8} bytes (with 8-byte ret)")
+    
+    # 生成pattern
+    print(f"\n[*] 常见偏移参考:")
+    if ret_offset <= 64:
+        print(f"    使用 cyclic({ret_offset}) 找偏移")
+    else:
+        print(f"    使用 pattern_offset 找偏移")
+
+def canary_calc(buf_size, canary_offset):
+    """计算canary偏移"""
+    print(f"[*] Buffer size: {buf_size} bytes")
+    print(f"[*] Canary offset: {canary_offset}")
+    print(f"[*] Payload structure:")
+    print(f"    [padding: {canary_offset} bytes] [canary: 8 bytes] [saved rbp: 8 bytes] [ret addr]")
+    print(f"    Total: {canary_offset + 24} bytes")
+
+def ret2libc_calc(libc_base, func_offset):
+    """计算ret2libc地址"""
+    addr = libc_base + func_offset
+    print(f"[*] Libc base:   0x{libc_base:x}")
+    print(f"[*] Func offset: 0x{func_offset:x}")
+    print(f"[*] Resolved:    0x{addr:x}")
+    return addr
+
+def find_gadget_binary(binary, gadget):
+    """用ROPgadget/ropper找gadget地址"""
+    # 尝试ROPgadget
+    try:
+        out = subprocess.check_output(
+            ['ROPgadget', '--binary', binary, '--ropchain', '--depth', '5'],
+            stderr=subprocess.DEVNULL, text=True
+        )
+        for line in out.splitlines():
+            if gadget in line:
+                print(f"  [ROPgadget] {line}")
+        return
+    except:
+        pass
+    
+    # 尝试ropper
+    try:
+        out = subprocess.check_output(
+            ['ropper', '-f', binary, '-i', gadget],
+            stderr=subprocess.DEVNULL, text=True
+        )
+        print(f"  [ropper] {out}")
+        return
+    except:
+        pass
+    
+    # 尝试objdump (简单grep)
+    try:
+        out = subprocess.check_output(
+            ['objdump', '-d', binary], stderr=subprocess.DEVNULL, text=True
+        )
+        for line in out.splitlines():
+            if gadget in line:
+                print(f"  [objdump] {line.strip()}")
+    except:
+        print("[-] 未找到gadget, 安装 ROPgadget 或 ropper")
+
+def calc_expr(expr):
+    """地址表达式计算"""
+    # 支持: 0x1234+0x5678, 0x1234-0x5678, 0x1234*2
+    try:
+        result = eval(expr.replace('0x', '0x'))
+        print(f"[*] {expr} = 0x{result:x} ({result})")
+    except:
+        print(f"[-] 无法计算: {expr}")
+
+def diff_calc(addr1, addr2):
+    """计算两个地址的差值"""
+    a1 = int(addr1, 16) if addr1.startswith('0x') else int(addr1)
+    a2 = int(addr2, 16) if addr2.startswith('0x') else int(addr2)
+    diff = a2 - a1
+    print(f"[*] 0x{a1:x} -> 0x{a2:x}")
+    print(f"[*] Diff: {diff} (0x{abs(diff):x})")
+    if diff > 0:
+        print(f"[*] 需要跳过 {diff} 字节")
+    else:
+        print(f"[*] 回退 {-diff} 字节")
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    
+    if cmd == '--overflow':
+        buf = int(sys.argv[2]) if len(sys.argv) > 2 else 64
+        ret = int(sys.argv[3]) if len(sys.argv) > 3 else 72
+        overflow_calc(buf, ret)
+    
+    elif cmd == '--canary':
+        buf = int(sys.argv[2]) if len(sys.argv) > 2 else 64
+        canary = int(sys.argv[3]) if len(sys.argv) > 3 else 72
+        canary_calc(buf, canary)
+    
+    elif cmd == '--ret2libc':
+        if len(sys.argv) < 4:
+            print("[-] Usage: pwn-offset --ret2libc <libc_base> <func_offset>")
+            sys.exit(1)
+        libc_base = int(sys.argv[2], 16)
+        func_off = int(sys.argv[3], 16)
+        ret2libc_calc(libc_base, func_off)
+    
+    elif cmd == '--rop-gadget':
+        if len(sys.argv) < 4:
+            print("[-] Usage: pwn-offset --rop-gadget <binary> <gadget_str>")
+            sys.exit(1)
+        find_gadget_binary(sys.argv[2], sys.argv[3])
+    
+    elif cmd == '--calc':
+        calc_expr(sys.argv[2])
+    
+    elif cmd == '--diff':
+        diff_calc(sys.argv[2], sys.argv[3])
+    
+    else:
+        # 直接输入一个偏移值
+        try:
+            offset = int(cmd)
+            print(f"[*] Offset: {offset} bytes")
+            print(f"    hex: 0x{offset:x}")
+            print(f"    to ret: {offset + 8} bytes (including saved rbp)")
+        except:
+            print(f"[-] Unknown command: {cmd}")
+            print(__doc__)
+
+if __name__ == '__main__':
+    main()

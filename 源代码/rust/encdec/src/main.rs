@@ -786,6 +786,7 @@ fn process(mode: &str, s: &str, decode: bool) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let args = Args::parse();
     let out = Out::new(Mode::from_flag(args.json));
     let _ = args.encode;

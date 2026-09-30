@@ -123,6 +123,7 @@ extern "C" fn on_sigint_json(_sig: i32) {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let args = Args::parse();
     let out = Out::new(Mode::from_flag(args.json));
 

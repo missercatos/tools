@@ -327,6 +327,7 @@ fn list_files(root: &Path) -> Vec<String> {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let args = Args::parse();
     let out = Out::new(Mode::from_flag(args.json));
 

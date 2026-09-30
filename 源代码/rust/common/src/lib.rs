@@ -18,6 +18,14 @@ pub fn finish(code: u8) -> ExitCode {
     ExitCode::from(code)
 }
 
+/// 恢复默认 SIGPIPE 处理: 管道下游提前关闭(如 | head)时安静退出而非panic
+pub fn reset_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Human,
@@ -182,12 +190,20 @@ pub mod http {
             body: Option<(&[u8], &str)>,
         ) -> Result<Response, String> {
             let m = method.to_ascii_uppercase();
+            let has_ua = headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+            let has_cookie = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("cookie"));
             let mut rb = ureq::http::Request::builder()
                 .method(m.as_str())
-                .uri(url)
-                .header("User-Agent", self.user_agent.as_str());
-            if let Some(c) = &self.cookie {
-                rb = rb.header("Cookie", c.as_str());
+                .uri(url);
+            if !has_ua {
+                rb = rb.header("User-Agent", self.user_agent.as_str());
+            }
+            if !has_cookie {
+                if let Some(c) = &self.cookie {
+                    rb = rb.header("Cookie", c.as_str());
+                }
             }
             for (k, v) in headers {
                 rb = rb.header(k.as_str(), v.as_str());

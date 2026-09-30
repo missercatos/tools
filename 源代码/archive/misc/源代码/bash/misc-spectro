@@ -1,0 +1,46 @@
+#!/bin/bash
+# misc-spectro: 音频频谱图生成
+# 用法: misc-spectro <audio_file> [output.png]
+# 依赖: sox (或 ffmpeg)
+
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; BOLD='\033[1m'; RESET='\033[0m'
+
+[[ $# -lt 1 ]] && { echo "Usage: $0 <audio> [output.png]"; exit 1; }
+
+AUDIO="$1"
+OUTPUT="${2:-$(basename "$AUDIO" | sed 's/\.[^.]*$//')_spectro.png}"
+
+[[ ! -f "$AUDIO" ]] && { echo -e "${RED}[-] File not found: $AUDIO${RESET}"; exit 1; }
+
+echo -e "${BOLD}[*] Generating spectrogram: $AUDIO${RESET}"
+
+# Try sox first
+if command -v sox &>/dev/null; then
+    echo -e "  Using sox..."
+    sox "$AUDIO" -n spectrogram -o "$OUTPUT" 2>/dev/null && {
+        echo -e "  ${GREEN}[+] Written to: $OUTPUT${RESET}"
+        exit 0
+    }
+fi
+
+# Try ffmpeg
+if command -v ffmpeg &>/dev/null; then
+    echo -e "  Using ffmpeg..."
+    ffmpeg -i "$AUDIO" -lavfi showspectrumpic=s=1024x512 -y "$OUTPUT" 2>/dev/null && {
+        echo -e "  ${GREEN}[+] Written to: $OUTPUT${RESET}"
+        exit 0
+    }
+fi
+
+# ASCII spectrogram fallback
+echo -e "  ${RED}[-] sox/ffmpeg not found, using ASCII fallback${RESET}"
+echo -e "\n  Install sox: pacman -S sox"
+echo -e "  Install ffmpeg: pacman -S ffmpeg"
+
+# Basic frequency analysis with sox (if available)
+if command -v sox &>/dev/null; then
+    echo -e "\n  ${BOLD}Audio Info:${RESET}"
+    sox --i "$AUDIO" 2>/dev/null | head -10
+fi

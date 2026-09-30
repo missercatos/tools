@@ -1,0 +1,12 @@
+# Rust 构建产物
+target/
+**/target/
+*.rlib
+*.rmeta
+# 编译临时
+*.o
+*.so
+*.d
+# 归档/临时
+*.tmp
+*~

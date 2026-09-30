@@ -1,0 +1,91 @@
+#!/bin/bash
+# misc-filetype: 快速文件类型检测
+# 用法: misc-filetype <file>...
+
+set -euo pipefail
+
+BOLD='\033[1m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; RESET='\033[0m'
+
+[[ $# -lt 1 ]] && { echo "Usage: $0 <file>..."; exit 1; }
+
+detect_file() {
+    local file="$1"
+    [[ ! -f "$file" ]] && { echo -e "  ${file}: ${RED}not found${RESET}"; return; }
+
+    local magic=$(xxd -p -l 16 "$file" 2>/dev/null)
+    local desc=""
+
+    case "$magic" in
+        89504e470d0a1a0a*) desc="PNG image" ;;
+        ffd8ff*)           desc="JPEG image" ;;
+        47494638*)         desc="GIF image" ;;
+        424d*)             desc="BMP image" ;;
+        504b0304*)         desc="ZIP archive / Office doc" ;;
+        504b0506*)         desc="ZIP archive (empty)" ;;
+        1f8b*)             desc="GZIP compressed" ;;
+        425a68*)           desc="BZIP2 compressed" ;;
+        fd377a585a00*)     desc="XZ compressed" ;;
+        377abcaf271c*)     desc="7-Zip archive" ;;
+        526172211a07*)     desc="RAR archive" ;;
+        25504446*)         desc="PDF document" ;;
+        d0cf11e0*)         desc="OLE2 (Office 97-2003)" ;;
+        53514c6974652066*) desc="SQLite database" ;;
+        0000001c66747970*) desc="MP4/MOV video" ;;
+        0000001866747970*) desc="MP4/MOV video" ;;
+        52494646*)         desc="RIFF (WAV/AVI)" ;;
+        49492a00*)         desc="TIFF image (LE)" ;;
+        4d4d002a*)         desc="TIFF image (BE)" ;;
+        7f454c46*)         desc="ELF executable" ;;
+        4d5a*)             desc="PE/COFF (Windows)" ;;
+        cafefabe*)         desc="Java class / Mach-O fat" ;;
+        664c6143*)         desc="FLAC audio" ;;
+        4f676753*)         desc="OGG container" ;;
+        28b52ffd*)         desc="Zstandard compressed" ;;
+        ffd8ff*)           desc="JPEG image" ;;
+        4c5a4950*)         desc="LZIP compressed" ;;
+        *)                 desc="" ;;
+    esac
+
+    # Check for text
+    if [[ -z "$desc" ]]; then
+        local printable=$(cat "$file" | head -c 512 | tr -cd '[:print:]\n\r\t' | wc -c)
+        local total=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+        if [[ $total -gt 0 && $printable -gt $((total * 90 / 100)) ]]; then
+            desc="Text file"
+        fi
+    fi
+
+    if [[ -z "$desc" ]]; then
+        desc="Unknown"
+    fi
+
+    # Get size
+    local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "?")
+    local size_hr=""
+    if [[ "$size" =~ ^[0-9]+$ ]]; then
+        if [[ $size -gt 1048576 ]]; then
+            if command -v bc &>/dev/null; then
+                size_hr=$(echo "scale=1; $size/1048576" | bc)
+            else
+                size_hr=$((size / 1048576))
+            fi
+            size_hr="${size_hr} MB"
+        elif [[ $size -gt 1024 ]]; then
+            if command -v bc &>/dev/null; then
+                size_hr=$(echo "scale=1; $size/1024" | bc)
+            else
+                size_hr=$((size / 1024))
+            fi
+            size_hr="${size_hr} KB"
+        else
+            size_hr="${size} B"
+        fi
+    fi
+
+    printf "  ${GREEN}%-30s${RESET} ${CYAN}%-25s${RESET} %s\n" "$file" "$desc" "($size_hr)"
+}
+
+echo -e "${BOLD}=== File Type Detection ===${RESET}"
+for f in "$@"; do
+    detect_file "$f"
+done

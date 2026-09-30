@@ -3,13 +3,15 @@ name = "sqli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "SQL 注入自动化: 五步方法论 + union/盲注 + tamper WAF绕过"
 
 [dependencies]
-common = { workspace = true }
+common = { workspace = true, features = ["http"] }
 clap = { workspace = true }
 colored = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
 
 [[bin]]
 name = "sqli"

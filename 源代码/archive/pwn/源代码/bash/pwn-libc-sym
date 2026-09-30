@@ -1,0 +1,82 @@
+#!/bin/bash
+# pwn-libc-sym: 查libc函数偏移
+# 用法: pwn-libc-sym <libc.so> [symbol...]
+# 例:   pwn-libc-sym libc.so system execve str_bin_sh
+#       pwn-libc-sym libc.so --all (列出所有函数)
+
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
+BOLD='\033[1m'; RESET='\033[0m'
+
+usage() {
+    echo "Usage: $0 <libc.so> [symbol...]"
+    echo "  $0 libc.so system execve __libc_start_main"
+    echo "  $0 libc.so --all          # 列出所有导出函数"
+    echo "  $0 libc.so --search printf # 模糊搜索"
+    exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+LIBC="$1"; shift
+
+[[ ! -f "$LIBC" ]] && { echo "[-] Not found: $LIBC"; exit 1; }
+
+# 检查是否为ELF
+MAGIC=$(xxd -p -l 4 "$LIBC" 2>/dev/null || true)
+[[ "$MAGIC" != "7f454c46" ]] && { echo "[-] Not an ELF file: $LIBC"; exit 1; }
+
+# 获取基址提示
+BASE=$(readelf -h "$LIBC" 2>/dev/null | grep 'Type:' || true)
+echo -e "${BOLD}[*] $LIBC${RESET}"
+echo "    $BASE"
+
+get_syms() {
+    nm -D "$LIBC" 2>/dev/null | grep ' [TtWw] ' | sed 's/@@.*//' | sort || \
+    readelf -sW "$LIBC" 2>/dev/null | awk '$4=="FUNC" && $7!="UND" {print $2, $8}' | sed 's/@@.*//' | sort || \
+    true
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+fi
+
+case "$1" in
+    --all|-a)
+        echo -e "\n${CYAN}导出函数:${RESET}"
+        get_syms | while read -r addr name; do
+            printf "  0x%-12s %s\n" "$addr" "$name"
+        done
+        ;;
+    --search|-s)
+        [[ $# -lt 2 ]] && { echo "[-] 需要搜索关键词"; exit 1; }
+        KEY="$2"
+        echo -e "\n${CYAN}搜索: ${KEY}${RESET}"
+        get_syms | grep -i "$KEY" | while read -r addr name; do
+            printf "  0x%-12s %s\n" "$addr" "$name"
+        done
+        ;;
+    --search-all|-S)
+        [[ $# -lt 2 ]] && { echo "[-] 需要搜索关键词"; exit 1; }
+        KEY="$2"
+        echo -e "\n${CYAN}搜索 (所有符号): ${KEY}${RESET}"
+        readelf -sW "$LIBC" 2>/dev/null | grep -i "$KEY" | while IFS= read -r line; do
+            echo "  $line"
+        done || true
+        ;;
+    *)
+        echo -e "\n${CYAN}符号偏移:${RESET}"
+        for sym in "$@"; do
+            ADDR=$(nm -D "$LIBC" 2>/dev/null | awk -v s="$sym" '$3 ~ "^"s"(@|$)" {print $1}' || true)
+            if [[ -z "$ADDR" ]]; then
+                # 尝试 readelf
+                ADDR=$(readelf -sW "$LIBC" 2>/dev/null | awk -v s="$sym" '$8 ~ "^"s"(@|$)" {print $2}' || true)
+            fi
+            if [[ -n "$ADDR" ]]; then
+                printf "  ${GREEN}0x%-12s${RESET} %s\n" "$ADDR" "$sym"
+            else
+                printf "  ${RED}%-12s${RESET} %s ${RED}(not found)${RESET}\n" "???" "$sym"
+            fi
+        done
+        ;;
+esac

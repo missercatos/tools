@@ -11,6 +11,7 @@ serde_json = { workspace = true }
 colored = { workspace = true }
 regex = { workspace = true }
 ureq = { workspace = true, optional = true }
+libc = { workspace = true }
 
 [features]
 default = []

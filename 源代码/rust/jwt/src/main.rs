@@ -457,6 +457,7 @@ fn cmd_brute(token: &str, dict_path: &str, out: &Out) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let args = Args::parse();
     let out = Out::new(Mode::from_flag(args.json));
 

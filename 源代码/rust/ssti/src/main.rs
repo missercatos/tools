@@ -442,6 +442,7 @@ fn payloads(out: &Out, a: &PayloadsArgs) -> u8 {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let args = Args::parse();
     let out = Out::new(Mode::from_flag(args.json));
     let code = match &args.cmd {

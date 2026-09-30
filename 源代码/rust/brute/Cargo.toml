@@ -1,0 +1,20 @@
+[package]
+name = "brute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Web 爆破终端：登录爆破 / 验证码闸门 / 会话轮换 / 已认证 REPL"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+common = { workspace = true }
+reqwest = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[[bin]]
+name = "brute"
+path = "src/main.rs"

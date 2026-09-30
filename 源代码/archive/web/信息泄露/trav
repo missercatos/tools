@@ -1,0 +1,657 @@
+#!/usr/bin/env bash
+# trav -- 通用值空间遍历工具（CTF 解题 / 终端习惯）
+# 值空间来源: 内联列表(a&b&c) / 字典文件(@file) / 内置字典(--dict) / 生成器({1..10})
+# 判别规则: ==CODE | !=CODE | contains:字符串 | grep:正则
+# 命中处理: 打印 HIT; --recurse 时把命中值回填为下一轮 base 继续深入
+# 注意: 多个值空间是纯字符串拼接, 分隔符(如 . 后缀前的点)由用户在值里写好
+
+set -u
+BASE="" SPACES="" RULE="" EXT_SPACE="" USER="" RECURSE=0 MAXDEPTH=5 TIMEOUT=5 THREADS=1 FOUND=0 GEN="" GEN_COUNT=2000
+DELAY=0 NOFOLLOW=0 UA_POOL=0
+HEADERS=()
+TESTED=0 HIT_COUNT=0 ERRORS=0
+WILDCARD_BODY=""
+DICT_DIR="$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)/ctf/wordlists"
+
+usage() {
+    cat <<'EOF'
+trav -- 用一批候选值挨个探测 URL，命中的打出来
+
+用法: trav <URL前缀> "<候选值>" <判定条件> [选项]
+
+候选值写法:
+  "a&b&c"        & 分隔
+  "@字典文件"    从文件读，每行一个
+  "{1..100}"     数字范围
+  --dict 名称    内置字典: dirs|backup|flag|endpoints|users
+
+--gen 生成器（替代候选值参数，用法: trav <URL> <判定> --gen 生成器名:条数）:
+  md5-0e:条数    现场搜索 md5 以 0e 开头的魔法哈希串（随机串+MD5+前缀判定）
+                 概率事件: 默认预算 90 秒（TRAV_GEN_TIME 可调），出多少算多少
+
+判定条件:
+  ==200         状态码正好是 200
+  !=404         状态码不是 404（文件存在）
+  contains:x    响应内容包含 x
+  grep:正则     匹配正则，并输出匹配的内容
+
+选项:
+  --ext ".zip&.tar.gz"  再加一组候选值，两两组合（文件名×后缀）
+  --user admin          候选值当密码，用 admin:密码 逐个试
+  --dict dirs           用内置字典当候选值（替代位置参数候选值）
+  --header "K: V"       附加请求头（可多次）
+  --ua                  随机浏览器 User-Agent
+  --recurse             命中后继续往下一层目录找
+  --maxdepth N          递归最多深入几层（默认 5）
+  --timeout N           每请求超时秒数（默认 5）
+  --threads N           并发数，提速用（默认 1）
+  --delay N             每请求间隔毫秒（限速/防封）
+  --no-follow           不跟随 3xx，打印 Location
+  --gen "md5-0e:条数"   生成候选值（与位置参数候选值互斥）
+
+示例:
+  trav http://x/ --dict dirs "!=404" --ext ".php&.html"
+  trav http://x/ "@pw.txt" "==200" --user admin
+  trav http://x/ "web&www&backup" "!=404" --ext ".zip&.tar.gz"
+  trav http://x/flag_in_here/ "1&2&3" "==200" --recurse
+  trav http://x/ --dict endpoints "contains:password" --header "X-Real-IP: 127.0.0.1"
+EOF
+    exit 1
+}
+
+BUILTIN() { # $1=名称 输出字典
+    case "$1" in
+        dirs) cat <<'L'
+admin
+upload
+uploads
+config
+configs
+data
+database
+db
+backup
+backups
+temp
+tmp
+test
+tests
+api
+v1
+assets
+static
+css
+js
+img
+images
+fonts
+include
+includes
+lib
+libs
+vendor
+node_modules
+logs
+log
+cache
+session
+user
+users
+profile
+manage
+manager
+system
+adminer
+phpmyadmin
+pma
+web
+www
+download
+files
+file
+doc
+docs
+help
+faq
+search
+index
+home
+src
+source
+old
+new
+dev
+prod
+flag
+f1ag
+upfile
+upload_file
+uploadfiles
+flag_dir
+admin123
+L
+            ;;
+        backup) cat <<'L'
+www.zip
+web.zip
+site.zip
+backup.zip
+backup.tar.gz
+backup.tar
+back.zip
+data.zip
+db.zip
+database.zip
+sql.zip
+bak.zip
+wwwroot.zip
+web.rar
+site.rar
+1.zip
+2.zip
+a.zip
+index.zip
+flag.zip
+admin.zip
+source.zip
+src.zip
+code.zip
+www.tar.gz
+web.tar.gz
+backup.sql
+db.sql
+data.sql
+dump.sql
+mysql.sql
+www.tar
+web.tar
+site.tar.gz
+old.zip
+old.tar.gz
+uploads.zip
+files.zip
+L
+            ;;
+        flag) cat <<'L'
+flag
+flag.txt
+flag.php
+flag.html
+f1ag.txt
+f1ag.php
+flag1
+flag2
+1.txt
+1.php
+getflag
+get_flag
+readflag
+fl4g
+FLAG
+flag_here
+flag_dir
+flag.zip
+flag.tar.gz
+index.php
+L
+            ;;
+        endpoints) cat <<'L'
+robots.txt
+sitemap.xml
+.env
+.gitignore
+.DS_Store
+phpinfo.php
+info.php
+test.php
+readme.md
+readme.txt
+README.md
+license
+LICENSE
+composer.json
+package.json
+web.config
+.htaccess
+crossdomain.xml
+security.txt
+index.php.bak
+config.php.bak
+config.php~
+admin.php
+manage.php
+login.php
+index.php.swp
+.env.bak
+flag.txt.bak
+L
+            ;;
+        users) cat <<'L'
+admin
+root
+administrator
+test
+guest
+user
+manager
+operator
+system
+support
+webmaster
+demo
+admin01
+admin2
+admin123
+root1
+root123
+service
+ctf
+user1
+operator1
+L
+            ;;
+        *) echo "未知内置字典: $1" >&2; return 1 ;;
+    esac
+}
+
+[ $# -lt 3 ] && usage
+
+POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ext)      EXT_SPACE="$2"; shift 2 ;;
+        --user)     USER="$2"; shift 2 ;;
+        --gen)      GEN="$2"; shift 2 ;;
+        --dict)     DICT_NAME="$2"; shift 2 ;;
+        --header)   HEADERS+=("$2"); shift 2 ;;
+        --ua)       UA_POOL=1; shift ;;
+        --recurse)  RECURSE=1; shift ;;
+        --maxdepth) MAXDEPTH="$2"; shift 2 ;;
+        --timeout)  TIMEOUT="$2"; shift 2 ;;
+        --threads)  THREADS="$2"; shift 2 ;;
+        --delay)    DELAY="$2"; shift 2 ;;
+        --no-follow) NOFOLLOW=1; shift ;;
+        -h|--help)  usage ;;
+        --*)        echo "未知选项: $1" >&2; usage ;;
+        *)          POS+=("$1"); shift ;;
+    esac
+done
+
+BASE="${POS[0]}"
+if [ -n "$GEN" ]; then
+    [ ${#POS[@]} -ge 2 ] || usage
+    RULE="${POS[1]}"
+    [ ${#POS[@]} -gt 2 ] && { echo "错误: --gen 模式下无需候选值参数" >&2; usage; }
+    SPACES="--gen:${GEN}"
+elif [ -n "${DICT_NAME:-}" ]; then
+    [ ${#POS[@]} -ge 2 ] || usage
+    RULE="${POS[1]}"
+    [ ${#POS[@]} -gt 2 ] && { echo "错误: --dict 模式下无需候选值参数" >&2; usage; }
+    if [ -f "$DICT_DIR/$DICT_NAME.txt" ]; then
+        SPACES="@$DICT_DIR/$DICT_NAME.txt"
+    else
+        SPACES="--builtin:$DICT_NAME"
+    fi
+else
+    [ ${#POS[@]} -ge 3 ] || usage
+    SPACES="${POS[1]}"; RULE="${POS[2]}"
+fi
+[ "$RECURSE" = 1 ] && THREADS=1
+[ "$THREADS" -gt 1 ] && [ "$DELAY" -gt 0 ] && { echo "警告: 并行模式下 --delay 无效" >&2; DELAY=0; }
+
+# 随机浏览器 UA
+UA_STR=""
+if [ "$UA_POOL" = 1 ]; then
+    UA_POOL_LIST=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0"
+    )
+    UA_STR="${UA_POOL_LIST[$((RANDOM % ${#UA_POOL_LIST[@]}))]}"
+fi
+
+# curl 公共参数
+CURL_ARGS=(-s --max-time "$TIMEOUT")
+[ "$NOFOLLOW" = 1 ] || CURL_ARGS+=(-L)
+[ -n "$UA_STR" ] && CURL_ARGS+=(-A "$UA_STR")
+for h in ${HEADERS[@]+"${HEADERS[@]}"}; do CURL_ARGS+=(-H "$h"); done
+
+# 值空间展开: 每行输出一个候选值
+expand() {
+    case "$1" in
+        @*) cat "${1#@}" ;;
+        --gen:*) gen_runner "${1#--gen:}" ;;
+        --builtin:*) BUILTIN "${1#--builtin:}" ;;
+        \{*\}) eval "echo $1" | tr ' ' '\n' ;;
+        *) echo "$1" | tr '&' '\n' ;;
+    esac
+}
+
+# 生成器分发: $1=name[:count]
+gen_runner() {
+    local name="${1%%:*}" count="${1##*:}"
+    [ "$name" = "$1" ] && count="$GEN_COUNT"
+    case "$name" in
+        md5-0e) gen_md5_0e "$count" ;;
+        *) echo "未知生成器: $name（当前支持 md5-0e）" >&2; return 1 ;;
+    esac
+}
+
+# md5 魔法哈希搜索: 随机串 → md5 → 0e 开头且其余全为数字
+# 概率 ~3亿次命中1个; 优先 C 加速(内嵌编译, ~2.3M/s/核), gcc 缺失时回退 python
+# 预算 TRAV_GEN_TIME(默认90s), 多进程按核数并行
+gen_md5_0e() {
+    local want="$1" budget="${TRAV_GEN_TIME:-90}" tmp bin rc nproc
+    tmp=$(mktemp -d) || return 1
+    bin="$tmp/md5gen"
+    if command -v gcc >/dev/null 2>&1 && gcc -O3 -o "$bin" -x c - 2>/dev/null <<'CCODE'
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <time.h>
+
+static uint64_t rng_state;
+static inline uint64_t rng_next(void) {
+    uint64_t x = rng_state;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return rng_state = x;
+}
+static inline uint32_t rol(uint32_t x, int c) { return (x << c) | (x >> (32 - c)); }
+static const uint32_t K[64] = {
+    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+    0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+    0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+    0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+    0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+    0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+    0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+};
+static const uint8_t S[64] = {
+    7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
+};
+static inline void md5_6(const char s[6], uint8_t out[16]) {
+    uint32_t a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
+    uint32_t m[16] = {0};
+    uint32_t st = (uint32_t)s[0] | ((uint32_t)s[1] << 8) | ((uint32_t)s[2] << 16) | ((uint32_t)s[3] << 24);
+    uint32_t st2 = (uint32_t)s[4] | ((uint32_t)s[5] << 8) | 0x00800000u;
+    m[0] = st; m[1] = st2; m[14] = 48;
+    uint32_t aa = a, bb = b, cc = c, dd = d, f, g, tmp;
+    for (int i = 0; i < 64; i++) {
+        if (i < 16)      { f = (bb & cc) | (~bb & dd);            g = i; }
+        else if (i < 32) { f = (dd & bb) | (~dd & cc);            g = (5 * i + 1) & 15; }
+        else if (i < 48) { f = bb ^ cc ^ dd;                      g = (3 * i + 5) & 15; }
+        else             { f = cc ^ (bb | ~dd);                   g = (7 * i) & 15; }
+        tmp = dd; dd = cc; cc = bb;
+        bb = bb + rol(a + f + K[i] + m[g], S[i]);
+        a = tmp;
+    }
+    uint32_t h0 = a + aa, h1 = b + bb, h2 = c + cc, h3 = d + dd;
+    memcpy(out, &h0, 4); memcpy(out + 4, &h1, 4);
+    memcpy(out + 8, &h2, 4); memcpy(out + 12, &h3, 4);
+}
+static const char chars[] =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+static char nbdig[256];
+static void init_nbdig(void) {
+    for (int i = 0; i < 256; i++) {
+        int hi = i >> 4, lo = i & 15;
+        nbdig[i] = (hi <= 9 && lo <= 9);
+    }
+}
+int main(int argc, char **argv) {
+    double budget = argc > 1 ? atof(argv[1]) : 90.0;
+    int want = argc > 2 ? atoi(argv[2]) : 10;
+    char outfile[64];
+    snprintf(outfile, sizeof outfile, "%s/w%d", getenv("OUTDIR"), getpid());
+    FILE *out = fopen(outfile, "w");
+    if (!out) return 1;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    rng_state = (uint64_t)tv.tv_usec ^ ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)&budget;
+    init_nbdig();
+    char s[7];
+    uint8_t h[16];
+    time_t start = time(NULL);
+    long hit = 0;
+    while (time(NULL) - start < budget) {
+        uint64_t r = rng_next();
+        s[0] = chars[r % 62]; r /= 62;
+        s[1] = chars[r % 62]; r /= 62;
+        s[2] = chars[r % 62]; r /= 62;
+        s[3] = chars[r % 62]; r /= 62;
+        s[4] = chars[r % 62]; r /= 62;
+        s[5] = chars[r % 62];
+        s[6] = 0;
+        md5_6(s, h);
+        if (h[0] == 0x0e) {
+            int ok = 1;
+            for (int i = 1; i < 16; i++)
+                if (!nbdig[h[i]]) { ok = 0; break; }
+            if (ok) {
+                hit++;
+                fprintf(out, "%s\n", s);
+                fflush(out);
+                if (hit >= want) break;
+            }
+        }
+    }
+    fclose(out);
+    return 0;
+}
+CCODE
+    then
+        nproc=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
+        [ "$nproc" -lt 1 ] && nproc=1
+        local pids=() i
+        for ((i = 0; i < nproc; i++)); do
+            OUTDIR="$tmp" "$bin" "$budget" "$want" 2>/dev/null &
+            pids+=("$!")
+        done
+        for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+        cat "$tmp"/w* 2>/dev/null | sort -u | head -n "$want"
+    else
+        python3 - "$want" "$budget" "$tmp" <<'PY'
+import hashlib, os, random, sys, time
+
+want = int(sys.argv[1]); budget = float(sys.argv[2]); outdir = sys.argv[3]
+chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+nproc = max(2, (os.cpu_count() or 2))
+pids = []
+for i in range(nproc):
+    pid = os.fork()
+    if pid == 0:
+        random.seed(os.urandom(8))
+        t0 = time.time()
+        with open(os.path.join(outdir, f"w{i}"), "w") as f:
+            while time.time() - t0 < budget:
+                ln = random.randint(6, 12)
+                s = "".join(random.choice(chars) for _ in range(ln))
+                h = hashlib.md5(s.encode()).hexdigest()
+                if h.startswith("0e") and h[2:].isdigit():
+                    f.write(s + "\n"); f.flush()
+        os._exit(0)
+    pids.append(pid)
+
+t0 = time.time()
+while time.time() - t0 < budget + 3:
+    done = 0
+    for p in pids:
+        r, _ = os.waitpid(p, os.WNOHANG)
+        if r != 0:
+            done += 1
+    if done == len(pids):
+        break
+    time.sleep(0.1)
+for p in pids:
+    try:
+        os.kill(p, 9)
+    except ProcessLookupError:
+        pass
+
+seen = []
+for i in range(nproc):
+    try:
+        with open(os.path.join(outdir, f"w{i}")) as f:
+            for line in f:
+                s = line.strip()
+                if s and s not in seen:
+                    seen.append(s)
+                    print(s)
+                    if len(seen) >= want:
+                        break
+    except FileNotFoundError:
+        pass
+PY
+    fi
+    rc=$?
+    rm -rf "$tmp"
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 141 ]; then
+        echo "[gen] 生成器异常退出 (rc=$rc)" >&2
+        return $rc
+    fi
+    return 0
+}
+
+join_url() { # $1=base $2=值
+    # --user 时值仅作密码，URL 保持原样
+    if [ -n "$USER" ] && [[ "$1" != *"{}"* ]]; then
+        echo "$1"; return
+    fi
+    case "$1" in
+        *\{\}*) echo "${1//\{\}/$2}" ;;
+        */) echo "${1}${2}" ;;
+        *) echo "${1}/${2}" ;;
+    esac
+}
+
+# wildcard 预检: 用随机串探测, 若命中说明目标对任意值都返回该结果
+wildcard_check() {
+    local rnd url resp code
+    rnd=$(date +%s%N | md5sum | head -c 10)
+    url=$(join_url "$BASE" "$rnd")
+    if [ -n "$USER" ]; then
+        resp=$(curl "${CURL_ARGS[@]}" -u "$USER:x$rnd" -w $'\n%{http_code}' "$url" 2>/dev/null)
+    else
+        resp=$(curl "${CURL_ARGS[@]}" -w $'\n%{http_code}' "$url" 2>/dev/null)
+    fi
+    [ -z "$resp" ] && return 0
+    code="${resp##*$'\n'}"
+    WILDCARD_BODY="${resp%$'\n'*}"
+    local hit=0
+    case "$RULE" in
+        ==*)            [ "$code" = "${RULE#==}" ] && hit=1 ;;
+        !=*)            [ "$code" != "${RULE#!=}" ] && hit=1 ;;
+        contains:*)     [[ "$WILDCARD_BODY" == *"${RULE#contains:}"* ]] && hit=1 ;;
+        grep:*)         grep -qE "${RULE#grep:}" <<<"$WILDCARD_BODY" && hit=1 ;;
+    esac
+    if [ "$hit" = 1 ]; then
+        echo "警告: 随机值也命中判定($rnd -> $code)，疑似通配响应，将过滤相同响应的候选值" >&2
+    else
+        WILDCARD_BODY=""
+    fi
+}
+
+# 单值探测: $1=完整URL $2=候选值 $3=当前深度
+probe() {
+    local url="$1" val="$2" depth="$3" resp code body loc rc
+    local curl_cmd
+    if [ -n "$USER" ]; then
+        curl_cmd=(curl "${CURL_ARGS[@]}" -u "$USER:$val" -w $'\n%{http_code}')
+    else
+        curl_cmd=(curl "${CURL_ARGS[@]}" -w $'\n%{http_code}')
+    fi
+    resp=$("${curl_cmd[@]}" "$url" 2>/dev/null)
+    rc=$?
+    TESTED=$((TESTED + 1))
+    if [ "$rc" -ne 0 ]; then
+        ERRORS=$((ERRORS + 1))
+        return 1
+    fi
+    code="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+
+    if [ -n "$WILDCARD_BODY" ] && [ "$body" = "$WILDCARD_BODY" ]; then
+        return 1
+    fi
+
+    case "$RULE" in
+        ==*)            [ "$code" = "${RULE#==}" ] || return 1 ;;
+        !=*)            [ "$code" != "${RULE#!=}" ] || return 1 ;;
+        contains:*)     [[ "$body" == *"${RULE#contains:}"* ]] || return 1 ;;
+        grep:*)         grep -qE "${RULE#grep:}" <<<"$body" || return 1 ;;
+        *)              echo "未知判别规则: $RULE" >&2; exit 1 ;;
+    esac
+
+    HIT_COUNT=$((HIT_COUNT + 1))
+    FOUND=1
+    echo -n "HIT: "; [ -n "$USER" ] && echo -n "$USER:$val => " || echo -n "$val => "
+    echo "$url -> $code"
+    if [ "$NOFOLLOW" = 1 ]; then
+        loc=$(curl -s -o /dev/null -w '%{redirect_url}' "${CURL_ARGS[@]}" "$url")
+        [ -n "$loc" ] && echo "    Location: $loc"
+    fi
+    case "$RULE" in
+        grep:*) echo "$body" | grep -oE "${RULE#grep:}" | sed 's/^/    /' ;;
+        contains:*) echo "    ...${RULE#contains:}..." ;;
+    esac
+
+    if [ "$RECURSE" = 1 ] && [ "$depth" -lt "$MAXDEPTH" ]; then
+        run "$url" "$((depth + 1))"
+    fi
+}
+
+# 主循环: $1=base $2=当前深度
+run() {
+    local base="$1" depth="$2" c e
+    local cand exts
+    mapfile -t cand < <(expand "$SPACES")
+    if [ -n "$EXT_SPACE" ]; then
+        mapfile -t exts < <(expand "$EXT_SPACE")
+    else
+        exts=("")
+    fi
+    for c in "${cand[@]}"; do
+        for e in "${exts[@]}"; do
+            probe "$(join_url "$base" "$c$e")" "$c" "$depth"
+            [ "$FOUND" = 1 ] && [ "$RECURSE" = 0 ] && return 0
+        done
+        if [ "$DELAY" -gt 0 ]; then
+            python3 -c "import time;time.sleep($DELAY/1000.0)"
+        fi
+    done
+}
+
+# 并行模式前也做 wildcard 检查
+wildcard_check
+
+if [ "$THREADS" -gt 1 ]; then
+    [ -n "$EXT_SPACE" ] && { echo "警告: --threads 并行模式不支持 --ext，已忽略" >&2; }
+    pids=()
+    while IFS= read -r c; do
+        probe "$(join_url "$BASE" "$c")" "$c" 1 &
+        pids+=("$!")
+        if [ "${#pids[@]}" -ge "$THREADS" ]; then
+            wait -n 2>/dev/null
+            alive=()
+            for p in "${pids[@]}"; do
+                kill -0 "$p" 2>/dev/null && alive+=("$p")
+            done
+            pids=("${alive[@]}")
+        fi
+    done < <(expand "$SPACES")
+    wait
+else
+    run "$BASE" 1
+fi
+
+echo "[*] 统计: 探测 $TESTED | 命中 $HIT_COUNT | 错误 $ERRORS" >&2
+exit $(( FOUND ? 0 : 1 ))

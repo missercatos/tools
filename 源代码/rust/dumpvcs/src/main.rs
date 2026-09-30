@@ -344,6 +344,7 @@ fn run_auto(args: &CommonArgs, client: &HttpClient, out: &Out) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let cli = Cli::parse();
     let out = Out::new(Mode::from_flag(cli.json));
 

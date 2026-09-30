@@ -169,6 +169,7 @@ fn write_byte(addr: u64, byte_val: u64, start: usize) -> (Vec<u8>, String) {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let args = Args::parse();
     let out = Out::new(Mode::from_flag(args.json));
 

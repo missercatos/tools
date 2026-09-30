@@ -558,6 +558,7 @@ fn has_names(child: &Child) -> bool {
 }
 
 fn main() -> ExitCode {
+    common::reset_sigpipe();
     let args = Args::parse();
     let out = Out::new(Mode::from_flag(args.json));
 
